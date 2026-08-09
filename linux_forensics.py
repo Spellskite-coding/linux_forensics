@@ -1,281 +1,1642 @@
 #!/usr/bin/env python3
-import os
-import sys
-import re
+# -*- coding: utf-8 -*-
+"""
+linux_forensics.py - DFIR LINUX SNIPER v2.0
+Corrélateur Réseau / Processus / Système de fichiers pour live forensics Linux.
+
+Contraintes de conception (inchangées) :
+  * Aucune dépendance externe (stdlib uniquement, Python >= 3.6).
+  * Exécution intégralement en mémoire : aucune écriture disque, aucun appel
+    réseau, aucun signal envoyé, aucun module chargé.
+  * Lecture seule stricte : O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOATIME.
+  * Comportement dégradé mais utile en utilisateur standard, complet en root.
+  * Confirmation explicite de l'analyste après affichage d'un avertissement.
+
+Sortie : indicateurs pondérés + SHA256 de chaque artefact retenu, pour
+pivot CTI (VirusTotal / MISP / OpenCTI / MalwareBazaar).
+
+Changelog v2.0
+--------------
+Correctifs de bugs :
+  * Filtrage loopback IPv6 inopérant (comparaison sur une chaîne contenant
+    le port) et sessions loopback ESTABLISHED remontées à tort.
+  * Conversion hexadécimale des adresses codée en dur pour little-endian.
+  * Écrasement d'entrées de socket sur l'inode 0 (TIME_WAIT / orphelins).
+  * Fuite de descripteur si os.fdopen() échouait après os.open().
+  * Blocage possible sur FIFO/device faute de contrôle S_ISREG.
+  * Comparaison de CapEff à une constante de 16 zéros (dépend du noyau).
+  * `break` inopérant sur la boucle externe lors du parsing d'environ.
+  * `f"{COULEUR}=" * 70` répétait la séquence ANSI 70 fois.
+  * input() sur stdin non interactif levait EOFError non gérée.
+  * PID 1 arbitrairement exclu de l'analyse.
+Durcissement :
+  * O_NOFOLLOW systématique (anti-symlink), lectures bornées, budget global
+    de fichiers, non-franchissement des points de montage, anti-ReDoS.
+  * Neutralisation des séquences ANSI présentes dans les noms de fichiers
+    et les cmdline (anti-injection dans le terminal de l'analyste).
+Détection ajoutée :
+  * Binaire supprimé ou memfd toujours en exécution, usurpation de nom de
+    thread noyau, ptrace actif, élévation RUID/EUID.
+  * Processus cachés (getdents filtré), LKM masqué, kernel tainted,
+    sockets sans propriétaire, /etc/ld.so.preload.
+  * Chasse fichiers dans les répertoires de prédilection des implants avec
+    SHA256, analyse de contenu des scripts déposés et des tâches planifiées.
+"""
+
+import argparse
+import errno
+import hashlib
 import ipaddress
+import os
+import re
+import stat
+import sys
+import time
 
-# ==========================================
+VERSION = "2.0"
+
+# ==========================================================================
 # CONFIGURATION & IoC
-# ==========================================
+# ==========================================================================
 
-SUSPICIOUS_CMD_KEYWORDS = [
-    'nc -e', 'nc -c', 'ncat ', '/dev/tcp/', '/dev/udp/', 'wget http',
-    'curl -s', 'base64 -d', 'nohup', 'bash -i', 'pty.spawn', 'socat',
-    'python3 -c', 'perl -e'
+# --- Limites de sûreté (anti-DoS sur soi-même) ---
+MAX_PROC_READ = 512 * 1024          # octets lus par pseudo-fichier /proc
+HASH_CHUNK = 1024 * 1024            # taille de bloc pour le SHA256
+DEFAULT_MAX_HASH_SIZE = 128 * 1024 * 1024
+DEFAULT_MAX_DEPTH = 6
+DEFAULT_MAX_FILES_PER_ROOT = 8000
+GLOBAL_FILE_BUDGET = 60000
+REGEX_PROBE_LIMIT = 64 * 1024        # borne les moteurs regex (anti-ReDoS sur fichier gonflé)
+MAX_PID_BRUTEFORCE = 131072
+
+# --- Seuils de scoring (réduction des faux positifs) ---
+SEV_CRITICAL = 70
+SEV_HIGH = 50
+SEV_MEDIUM = 30
+
+# --- Patterns de ligne de commande (regex ciblées, pas de mots-clés nus) ---
+CMD_PATTERNS = [
+    (re.compile(r'/dev/(tcp|udp)/[0-9a-z]', re.I),
+     "Reverse shell natif bash (/dev/tcp)", 70),
+    (re.compile(r'\b(nc|ncat|netcat)(\.\w+)?\b[^;|&]{0,120}?\s-\w*e\w*(\s|$)'),
+     "Netcat avec exécution de commande (-e/-c)", 65),
+    (re.compile(r'\b(curl|wget)\b[^;|&]{0,160}\|\s*(ba|z|k|da)?sh\b'),
+     "Téléchargement redirigé vers un interpréteur (dropper)", 70),
+    (re.compile(r'\b(curl|wget)\b[^;|&]{0,160}\s-O\s*/(tmp|dev/shm|var/tmp)/'),
+     "Téléchargement vers un répertoire monde-inscriptible", 55),
+    (re.compile(r'\bpython[0-9.]*\s+-c\b.{0,300}?(socket\.socket|pty\.spawn|os\.dup2|'
+                r'SOCK_STREAM|connect\()', re.S),
+     "One-liner Python établissant un socket / relais de tty", 60),
+    (re.compile(r'\bpython[0-9.]*\s+-c\b.{0,300}?(subprocess|os\.system|os\.popen|'
+                r'exec\(|eval\()', re.S),
+     "One-liner Python exécutant des commandes (LotL, à corréler)", 25),
+    (re.compile(r'\bperl\s+-e\b.{0,300}?(socket|exec|system)', re.S),
+     "One-liner Perl orienté shell/socket", 60),
+    (re.compile(r'\bruby\s+-r?socket\b'), "One-liner Ruby socket", 55),
+    (re.compile(r'\bphp\s+-r\b.{0,300}?(fsockopen|exec|system)', re.S),
+     "One-liner PHP orienté shell/socket", 60),
+    (re.compile(r'\bsocat\b[^;|&]{0,160}(exec|system):', re.I),
+     "Socat avec exécution de commande", 65),
+    (re.compile(r'\bbase64\s+(-d|--decode)\b[^;|&]{0,120}\|\s*(ba|z|k|da)?sh\b'),
+     "Payload base64 décodé puis exécuté", 70),
+    (re.compile(r'\b(bash|sh|zsh|ksh)\s+-[a-z]*i\b'),
+     "Shell interactif lancé en ligne de commande", 30),
+    (re.compile(r'\bhistory\s+-c\b|\bunset\s+HISTFILE\b|HISTFILE=/dev/null|HISTSIZE=0'),
+     "Anti-forensic : neutralisation de l'historique shell", 55),
+    (re.compile(r'\bchattr\s+[+-]i\b'),
+     "Anti-forensic : verrouillage d'attribut immuable", 45),
+    (re.compile(r'ld\.so\.preload'),
+     "Manipulation de /etc/ld.so.preload (hooking userland)", 60),
+    (re.compile(r'\binsmod\b|\bmodprobe\s+\./|/proc/self/mem\b'),
+     "Manipulation noyau / mémoire du processus courant", 55),
+    (re.compile(r'memfd_create|/memfd:'),
+     "Exécution depuis un fichier anonyme en mémoire (memfd)", 65),
+    (re.compile(r'\b(xmrig|minerd|cpuminer|kdevtmpfsi|kinsing|tsunami|dota3?|'
+                r'watchdogs|sysrv|xmr-stak|nanominer|teamtnt)\b', re.I),
+     "Nom associé à un malware/cryptominer Linux connu", 85),
+    (re.compile(r'--donate-level|stratum\+tcp://|pool\.(minexmr|supportxmr|nanopool)', re.I),
+     "Configuration de pool de minage", 85),
+    (re.compile(r'\b(chmod|chown)\s+[+7]?[0-7]{0,4}s?\s+/(tmp|dev/shm|var/tmp)/'),
+     "Modification de permissions dans un répertoire temporaire", 35),
 ]
 
-SUSPICIOUS_ENV_VARS = ['LD_PRELOAD', 'PROMPT_COMMAND', 'LD_AUDIT']
+# --- Variables d'environnement à haut risque ---
+ENV_CRITICAL = ('LD_PRELOAD', 'LD_AUDIT')
+ENV_WATCH = ('LD_LIBRARY_PATH', 'PROMPT_COMMAND', 'BASH_ENV', 'ENV', 'PYTHONSTARTUP')
 
-# Couleurs ANSI
-RED = '\033[91m'
-CYAN = '\033[96m'
-YELLOW = '\033[93m'
-RESET = '\033[0m'
-BOLD = '\033[1m'
+# Chemins tolérés pour LD_PRELOAD/LD_AUDIT (intégrations légitimes connues)
+ENV_ALLOW_SUBSTR = (
+    'libsnapd-glib', '/snap/', 'nvidia', 'libgtk3-nocsd', 'libfakeroot',
+    'libjemalloc', 'libtcmalloc', 'libnss_', 'libpam', '/usr/lib/apt/',
+    'libSegFault', 'libjvm', 'libasan', 'libtsan', 'libeatmydata',
+)
 
-# ==========================================
-# MOTEUR I/O SÉCURISÉ & SANITIZATION
-# ==========================================
+# --- Répertoires d'exécution atypiques ---
+EXEC_RED_ZONES = (
+    '/tmp/', '/var/tmp/', '/dev/shm/', '/run/shm/', '/dev/mqueue/',
+    '/var/spool/', '/var/lock/', '/var/run/', '/run/user/',
+)
+EXEC_TRUSTED_PREFIX = (
+    '/usr/bin/', '/usr/sbin/', '/usr/lib/', '/usr/libexec/', '/usr/share/',
+    '/bin/', '/sbin/', '/lib/', '/lib64/', '/opt/', '/snap/',
+    '/usr/local/bin/', '/usr/local/sbin/', '/usr/local/lib/', '/usr/local/libexec/',
+)
 
-def sanitize_str(text):
-    if not text: return ""
-    return re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', text).strip()
+# --- Capacités Linux réellement dangereuses pour un processus non-root ---
+DANGEROUS_CAPS = {
+    1: 'CAP_DAC_OVERRIDE', 2: 'CAP_DAC_READ_SEARCH', 4: 'CAP_FOWNER',
+    6: 'CAP_SETGID', 7: 'CAP_SETUID', 8: 'CAP_SETPCAP',
+    16: 'CAP_SYS_MODULE', 17: 'CAP_SYS_RAWIO', 18: 'CAP_SYS_CHROOT',
+    19: 'CAP_SYS_PTRACE', 21: 'CAP_SYS_ADMIN', 22: 'CAP_SYS_BOOT',
+    38: 'CAP_PERFMON', 39: 'CAP_BPF',
+}
 
-def safe_read_file(filepath):
+# --- Noms de threads noyau usurpés par les rootkits userland ---
+KTHREAD_LIKE = re.compile(
+    r'^\[?(kworker|ksoftirqd|kthreadd|migration|rcu_|watchdog|kswapd|'
+    r'kcompactd|khugepaged|kdevtmpfs|kaudit|kintegrity|jbd2|ext4-|'
+    r'irq/|scsi_|md|xfs)', re.I)
+
+# --- Fichiers de persistance systématiquement empreintés ---
+PERSISTENCE_FILES = (
+    '/etc/ld.so.preload', '/etc/rc.local', '/etc/crontab',
+    '/etc/hosts.deny', '/etc/sudoers',
+)
+PERSISTENCE_DIRS = (
+    '/etc/cron.d', '/etc/cron.hourly', '/etc/cron.daily',
+    '/etc/cron.weekly', '/etc/cron.monthly', '/etc/profile.d',
+    '/etc/update-motd.d', '/var/spool/cron', '/var/spool/cron/crontabs',
+)
+# Deux niveaux : le niveau faible (curl/wget seuls) est omniprésent dans les
+# scripts légitimes de distribution (update-motd, apt, certbot...).
+PERSISTENCE_STRONG = re.compile(
+    r'/dev/tcp/|\b(nc|ncat|netcat)\b[^\n]{0,80}\s-\w*e|'
+    r'base64\s+(-d|--decode)[^\n]{0,80}\|\s*(ba)?sh|'
+    r'(curl|wget)[^\n]{0,120}\|\s*(ba)?sh|'
+    r'\b(chattr\s+[+-]i|history\s+-c|HISTFILE=/dev/null)\b|'
+    r'(/tmp/|/dev/shm/|/var/tmp/)[\w.\-]*\s*(&|;|$)', re.I | re.M)
+PERSISTENCE_WEAK = re.compile(
+    r'\b(curl|wget)\b|\bbase64\b|\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b', re.I)
+
+# --- Magies de fichiers ---
+MAGIC_ELF = b'\x7fELF'
+MAGIC_SCRIPT = b'#!'
+
+# ==========================================================================
+# PRÉSENTATION TERMINAL
+# ==========================================================================
+
+class Palette(object):
+    """Codes ANSI, neutralisés si la sortie n'est pas un TTY (--no-color)."""
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+
+    def __call__(self, text, code):
+        if not self.enabled:
+            return text
+        return '\033[%sm%s\033[0m' % (code, text)
+
+    def red(self, t):
+        return self(t, '91')
+
+    def green(self, t):
+        return self(t, '92')
+
+    def yellow(self, t):
+        return self(t, '93')
+
+    def cyan(self, t):
+        return self(t, '96')
+
+    def grey(self, t):
+        return self(t, '90')
+
+    def bold(self, t):
+        return self(t, '1')
+
+
+C = Palette(False)   # remplacé dans main()
+
+
+def out(msg=''):
     try:
-        flags = os.O_RDONLY | os.O_NOATIME | os.O_NONBLOCK
-        fd = os.open(filepath, flags)
-    except OSError:
-        try:
-            fd = os.open(filepath, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError:
-            return None
+        sys.stdout.write(msg + '\n')
+    except (BrokenPipeError, ValueError):
+        raise SystemExit(0)
+
+
+def severity_label(score):
+    if score >= SEV_CRITICAL:
+        return 'CRITIQUE', C.red
+    if score >= SEV_HIGH:
+        return 'ELEVE', C.red
+    if score >= SEV_MEDIUM:
+        return 'MOYEN', C.yellow
+    return 'INFO', C.cyan
+
+
+# ==========================================================================
+# MOTEUR I/O SÉCURISÉ (lecture seule, non bloquant, anti-symlink)
+# ==========================================================================
+
+O_NOATIME = getattr(os, 'O_NOATIME', 0o1000000)
+O_CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
+
+_STATS = {
+    'noatime_ok': 0,
+    'noatime_fallback': 0,
+    'read_denied': 0,
+    'hashed': 0,
+    'hash_bytes': 0,
+}
+
+
+def open_ro(path, nofollow=True):
+    """Ouvre un fichier en lecture seule sans jamais suivre de lien symbolique
+    et sans jamais bloquer (FIFO / device). Retourne un fd ou None."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | O_CLOEXEC
+    if nofollow:
+        flags |= os.O_NOFOLLOW
     try:
-        with os.fdopen(fd, 'r', encoding='utf-8', errors='ignore') as f:
-            return f.read(512000)
-    except Exception:
+        fd = os.open(path, flags | O_NOATIME)
+        _STATS['noatime_ok'] += 1
+        return fd
+    except OSError as exc:
+        # O_NOATIME exige d'être propriétaire du fichier ou CAP_FOWNER.
+        if exc.errno in (errno.EPERM, errno.EACCES, errno.EINVAL, errno.EROFS):
+            try:
+                fd = os.open(path, flags)
+                _STATS['noatime_fallback'] += 1
+                return fd
+            except OSError:
+                _STATS['read_denied'] += 1
+                return None
+        _STATS['read_denied'] += 1
         return None
 
-# ==========================================
-# RÉSOLUTION RÉSEAU & NAMESPACES
-# ==========================================
 
-def hex_to_ip(hex_str):
-    """Convertit les IP:Port hexadécimales (IPv4 et IPv6 little-endian) du noyau."""
+def read_bytes(path, limit=MAX_PROC_READ, nofollow=True, require_regular=False):
+    """Lecture bornée et non bloquante. Ne lève jamais."""
+    fd = open_ro(path, nofollow=nofollow)
+    if fd is None:
+        return None
     try:
-        ip_hex, port_hex = hex_str.split(':')
-        port = int(port_hex, 16)
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return None
+        if require_regular and not stat.S_ISREG(st.st_mode):
+            return None
+        buf = bytearray()
+        while len(buf) < limit:
+            try:
+                chunk = os.read(fd, min(65536, limit - len(buf)))
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        return bytes(buf)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
-        if len(ip_hex) == 8: # IPv4
-            ip = f"{int(ip_hex[6:8], 16)}.{int(ip_hex[4:6], 16)}.{int(ip_hex[2:4], 16)}.{int(ip_hex[0:2], 16)}"
-            return f"{ip}:{port}"
 
-        elif len(ip_hex) == 32: # IPv6 (Format noyau : 4 mots de 32 bits little-endian)
-            words = [ip_hex[i:i+8] for i in range(0, 32, 8)]
-            ipv6_raw = "".join([w[6:8] + w[4:6] + w[2:4] + w[0:2] for w in words])
-            ipv6_formatted = ":".join([ipv6_raw[i:i+4] for i in range(0, 32, 4)])
-            ip = str(ipaddress.IPv6Address(ipv6_formatted).compressed)
-            return f"[{ip}]:{port}"
+def read_text(path, limit=MAX_PROC_READ, nofollow=True):
+    data = read_bytes(path, limit=limit, nofollow=nofollow)
+    if data is None:
+        return None
+    return data.decode('utf-8', 'replace')
 
-        return "Unknown:Port"
-    except Exception:
-        return "ParseError:Port"
 
-def get_active_network_sockets():
-    """Extrait les inodes des sockets TCP/UDP actifs."""
-    sockets = {}
-    target_states = ['01', '02', '0A'] # ESTABLISHED, SYN_SENT, LISTEN
+def sanitize(text, maxlen=None):
+    """Neutralise les caractères de contrôle (protection du terminal contre
+    l'injection de séquences ANSI par un nom de fichier ou une cmdline)."""
+    if not text:
+        return ''
+    clean = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', text)
+    clean = re.sub(r'\s{2,}', ' ', clean).strip()
+    if maxlen and len(clean) > maxlen:
+        clean = clean[:maxlen] + '...'
+    return clean
 
-    for proto in ['tcp', 'tcp6', 'udp', 'udp6']:
-        filepath = f'/proc/net/{proto}'
-        if not os.path.exists(filepath):
+
+def readlink(path):
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def sha256_fd(fd, size_hint, max_size):
+    """Empreinte un descripteur déjà ouvert et validé. Retourne (hash, magic)."""
+    if size_hint is not None and size_hint > max_size:
+        return 'NON-CALCULE (taille > limite)', b''
+    h = hashlib.sha256()
+    magic = b''
+    total = 0
+    while True:
+        try:
+            chunk = os.read(fd, HASH_CHUNK)
+        except (BlockingIOError, InterruptedError):
+            break
+        except OSError:
+            return None, magic
+        if not chunk:
+            break
+        if not magic:
+            magic = chunk[:8]
+        total += len(chunk)
+        if total > max_size:
+            return 'NON-CALCULE (taille > limite)', magic
+        h.update(chunk)
+    _STATS['hashed'] += 1
+    _STATS['hash_bytes'] += total
+    return h.hexdigest(), magic
+
+
+def sha256_path(path, max_size, nofollow=True):
+    """SHA256 d'un fichier régulier. Ne suit pas les symlinks, ne bloque pas
+    sur un FIFO ou un device."""
+    fd = open_ro(path, nofollow=nofollow)
+    if fd is None:
+        return None, b''
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return None, b''
+        if not stat.S_ISREG(st.st_mode):
+            return None, b''
+        return sha256_fd(fd, st.st_size, max_size)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def file_kind(magic):
+    if magic.startswith(MAGIC_ELF):
+        return 'ELF'
+    if magic.startswith(MAGIC_SCRIPT):
+        return 'SCRIPT'
+    if magic[:2] in (b'\x1f\x8b',) or magic[:4] in (b'PK\x03\x04', b'\xfd7zXZ'):
+        return 'ARCHIVE'
+    return 'DATA'
+
+
+def fmt_time(epoch):
+    try:
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(epoch))
+    except (ValueError, OSError):
+        return '?'
+
+
+def fmt_size(n):
+    for unit in ('o', 'Ko', 'Mo', 'Go'):
+        if n < 1024:
+            return '%d%s' % (n, unit)
+        n //= 1024
+    return '%dTo' % n
+
+
+# ==========================================================================
+# COLLECTE DES RÉSULTATS
+# ==========================================================================
+
+class Report(object):
+    def __init__(self):
+        self.findings = []
+        self.iocs = []          # (sha256, path, contexte)
+        self._seen_hash = set()
+
+    def add(self, score, category, title, details, hashes=None):
+        self.findings.append({
+            'score': score, 'category': category, 'title': title,
+            'details': details, 'hashes': hashes or [],
+        })
+
+    def add_ioc(self, digest, path, context):
+        if not digest or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            return
+        key = (digest, path)
+        if key in self._seen_hash:
+            return
+        self._seen_hash.add(key)
+        self.iocs.append((digest, path, context))
+
+    def sorted_findings(self, min_score):
+        keep = [f for f in self.findings if f['score'] >= min_score]
+        return sorted(keep, key=lambda f: -f['score'])
+
+
+REPORT = Report()
+
+
+# ==========================================================================
+# RÉSOLUTION RÉSEAU
+# ==========================================================================
+
+TCP_STATES = {
+    '01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV', '04': 'FIN_WAIT1',
+    '05': 'FIN_WAIT2', '06': 'TIME_WAIT', '07': 'CLOSE', '08': 'CLOSE_WAIT',
+    '09': 'LAST_ACK', '0A': 'LISTEN', '0B': 'CLOSING',
+}
+TCP_TARGET_STATES = ('01', '02', '0A')      # ESTABLISHED, SYN_SENT, LISTEN
+
+
+def _hex_to_addr(hex_addr):
+    """Convertit une adresse hexadécimale du noyau (ordre hôte) en objet
+    ipaddress. Gère explicitement l'endianness de la machine."""
+    raw = bytes(bytearray.fromhex(hex_addr))
+    if len(raw) == 4:
+        if sys.byteorder == 'little':
+            raw = raw[::-1]
+        return ipaddress.IPv4Address(raw)
+    if len(raw) == 16:
+        if sys.byteorder == 'little':
+            raw = b''.join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+        return ipaddress.IPv6Address(raw)
+    raise ValueError('longueur d adresse inattendue')
+
+
+def parse_hex_endpoint(token):
+    """'0100007F:1F90' -> (IPv4Address, 8080). Retourne (None, None) si KO."""
+    try:
+        hex_addr, hex_port = token.split(':')
+        return _hex_to_addr(hex_addr), int(hex_port, 16)
+    except (ValueError, ipaddress.AddressValueError):
+        return None, None
+
+
+def addr_repr(addr, port):
+    if addr is None:
+        return '?:?'
+    if addr.version == 6:
+        return '[%s]:%d' % (addr.compressed, port)
+    return '%s:%d' % (addr.compressed, port)
+
+
+def is_unspecified(addr):
+    return addr is not None and int(addr) == 0
+
+
+def parse_socket_table(path, proto):
+    """Parse une table /proc/net/{tcp,tcp6,udp,udp6}. Retourne {inode: info}."""
+    content = read_text(path)
+    if not content:
+        return {}
+    result = {}
+    for line in content.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        local_tok, remote_tok, state, uid, inode = (
+            parts[1], parts[2], parts[3].upper(), parts[7], parts[9])
+        if inode == '0':
+            continue                      # sockets orphelins / TIME_WAIT
+        if proto.startswith('tcp') and state not in TCP_TARGET_STATES:
             continue
 
-        content = safe_read_file(filepath)
-        if not content: continue
+        laddr, lport = parse_hex_endpoint(local_tok)
+        raddr, rport = parse_hex_endpoint(remote_tok)
+        if laddr is None:
+            continue
 
-        lines = content.splitlines()[1:]
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 10:
-                local_addr, remote_addr, state, inode = parts[1], parts[2], parts[3], parts[9]
+        # Filtrage du trafic strictement local (corrige le bug de la v1 :
+        # les sessions établies 127.0.0.1 <-> 127.0.0.1 passaient au travers).
+        loop_local = laddr.is_loopback
+        loop_remote = raddr is not None and (raddr.is_loopback or is_unspecified(raddr))
+        if loop_local and loop_remote:
+            continue
 
-                if proto.startswith('tcp') and state not in target_states:
-                    continue
+        remote_public = bool(raddr is not None and not is_unspecified(raddr)
+                             and not raddr.is_private and not raddr.is_loopback
+                             and not raddr.is_link_local and not raddr.is_multicast)
+        listening_public = bool(state == '0A' and not laddr.is_loopback)
 
-                # Ignore le trafic purement local (Loopback IPv4 127.0.0.1 et IPv6 ::1)
-                if (local_addr.startswith('0100007F') and remote_addr == '00000000:0000') or \
-                   (local_addr == '00000000000000000000000001000000' and remote_addr == '00000000000000000000000000000000'):
-                    continue
+        result[inode] = {
+            'proto': proto,
+            'state': TCP_STATES.get(state, 'UDP' if proto.startswith('udp') else state),
+            'local': addr_repr(laddr, lport),
+            'remote': addr_repr(raddr, rport) if raddr is not None else '-',
+            'remote_public': remote_public,
+            'remote_ip': raddr.compressed if raddr is not None else None,
+            'listening_public': listening_public,
+            'uid': uid,
+        }
+    return result
 
-                sockets[inode] = {
-                    'proto': proto,
-                    'local': hex_to_ip(local_addr),
-                    'remote': hex_to_ip(remote_addr)
-                }
-    return sockets
 
-def get_process_sockets(pid):
-    """Récupère les inodes réseau associés à un PID."""
+def collect_sockets(netns_pids, is_root):
+    """Agrège les tables de sockets du namespace courant et, en root, de tous
+    les namespaces réseau distincts trouvés (détection de C2 conteneurisé)."""
+    tables = {}
+    namespaces = {'host': ''}
+    if is_root:
+        namespaces.update(netns_pids)
+
+    for ns_id, pid in namespaces.items():
+        base = '/proc/net' if not pid else '/proc/%s/net' % pid
+        for proto in ('tcp', 'tcp6', 'udp', 'udp6'):
+            path = '%s/%s' % (base, proto)
+            if not os.path.exists(path):
+                continue
+            for inode, info in parse_socket_table(path, proto).items():
+                info['netns'] = ns_id
+                tables.setdefault(inode, info)
+    return tables
+
+
+def process_socket_inodes(pid):
+    """Inodes de socket détenus par un PID (via /proc/<pid>/fd)."""
     inodes = set()
-    fd_dir = f'/proc/{pid}/fd'
-    if not os.path.exists(fd_dir):
-        return inodes
-
+    fd_dir = '/proc/%s/fd' % pid
     try:
         with os.scandir(fd_dir) as entries:
             for entry in entries:
-                try:
-                    link = os.readlink(entry.path)
-                    if link.startswith('socket:['):
-                        inodes.add(link[8:-1])
-                except OSError:
-                    pass
+                link = readlink(entry.path)
+                if link and link.startswith('socket:['):
+                    inodes.add(link[8:-1])
     except OSError:
         pass
     return inodes
 
-def get_init_namespace():
-    """Récupère le namespace réseau du processus init (PID 1) comme référence."""
+
+# ==========================================================================
+# INSPECTION DES PROCESSUS
+# ==========================================================================
+
+PF_KTHREAD = 0x00200000
+
+
+def parse_proc_stat(pid):
+    """Parse /proc/<pid>/stat en gérant les comm contenant espaces/parenthèses."""
+    raw = read_text('/proc/%s/stat' % pid, limit=8192)
+    if not raw:
+        return None
+    close = raw.rfind(')')
+    open_ = raw.find('(')
+    if close == -1 or open_ == -1 or close < open_:
+        return None
+    comm = raw[open_ + 1:close]
+    fields = raw[close + 1:].split()
+    if len(fields) < 20:
+        return None
     try:
-        return os.readlink('/proc/1/ns/net')
-    except OSError:
+        return {
+            'comm': comm,
+            'state': fields[0],
+            'ppid': fields[1],
+            'flags': int(fields[6]),
+            'starttime': fields[19],
+        }
+    except (ValueError, IndexError):
         return None
 
-# ==========================================
-# LE MOTEUR DU SNIPER (OPTIMISÉ SCANDIR)
-# ==========================================
 
-def hunt_c2_and_anomalies(is_root):
-    print(f"{CYAN}[*] Étape 1 : Cartographie des sockets réseau actifs (ESTABLISHED / LISTEN / UDP)...{RESET}")
-    active_sockets = get_active_network_sockets()
-    print(f"{CYAN}[*] {len(active_sockets)} sockets réseau pertinents identifiés.{RESET}")
+def parse_proc_status(pid):
+    raw = read_text('/proc/%s/status' % pid, limit=32768)
+    if not raw:
+        return {}
+    info = {}
+    for line in raw.splitlines():
+        if ':' not in line:
+            continue
+        key, _, value = line.partition(':')
+        info[key.strip()] = value.strip()
+    return info
 
-    init_ns = get_init_namespace()
-    print(f"{CYAN}[*] Étape 2 : Corrélation PID <-> Socket et recherche d'anomalies (Tir de précision)...{RESET}\n")
-    found = False
 
+def caps_to_names(cap_hex):
+    try:
+        mask = int(cap_hex, 16)
+    except (ValueError, TypeError):
+        return []
+    return [name for bit, name in DANGEROUS_CAPS.items() if mask & (1 << bit)]
+
+
+def path_is_hidden(path):
+    return any(part.startswith('.') and part not in ('.', '..')
+               for part in path.split('/') if part)
+
+
+def analyse_process(pid, sockets, init_netns, args, is_root):
+    """Analyse un PID et retourne un dict de constat si le score est retenu."""
+    proc_dir = '/proc/%s' % pid
+    st = parse_proc_stat(pid)
+    if st is None:
+        return None
+
+    # Les threads noyau n'ont ni exe ni cmdline : on les exclut du scoring
+    # métier, sauf s'ils détiennent un socket (cas rootkit LKM).
+    is_kthread = bool(st['flags'] & PF_KTHREAD)
+
+    score = 0
+    reasons = []
+    hashes = []
+
+    # --- Contexte réseau ---
+    net_ctx = []
+    public_egress = False
+    public_listen = False
+    for inode in process_socket_inodes(pid):
+        info = sockets.get(inode)
+        if not info:
+            continue
+        net_ctx.append('%s %s %s -> %s' % (
+            info['proto'].upper(), info['state'], info['local'], info['remote']))
+        public_egress |= info['remote_public']
+        public_listen |= info['listening_public']
+
+    if is_kthread and net_ctx:
+        score += 60
+        reasons.append(('Thread noyau détenant un socket réseau (rootkit LKM ?)', 60))
+    elif is_kthread:
+        return None
+
+    # --- Binaire exécuté ---
+    exe_raw = readlink('%s/exe' % proc_dir)
+    exe = exe_raw or ''
+    exe_deleted = exe.endswith(' (deleted)')
+    exe_clean = exe[:-10] if exe_deleted else exe
+
+    if exe_deleted:
+        score += 65
+        reasons.append(('Binaire supprimé du disque mais toujours en exécution : %s'
+                        % sanitize(exe_clean, 160), 65))
+    if exe_clean.startswith('/memfd:') or exe_clean.startswith('memfd:'):
+        score += 75
+        reasons.append(('Exécution depuis un fichier anonyme en mémoire (memfd) : %s'
+                        % sanitize(exe_clean, 120), 75))
+    elif exe_clean:
+        in_red = any(exe_clean.startswith(z) for z in EXEC_RED_ZONES)
+        trusted = any(exe_clean.startswith(p) for p in EXEC_TRUSTED_PREFIX)
+        if in_red:
+            score += 55
+            reasons.append(('Exécution depuis une zone monde-inscriptible : %s'
+                            % sanitize(exe_clean, 160), 55))
+        elif path_is_hidden(exe_clean) and not trusted:
+            score += 45
+            reasons.append(('Exécution depuis un répertoire caché : %s'
+                            % sanitize(exe_clean, 160), 45))
+
+    # --- Usurpation d'identité de thread noyau ---
+    comm = sanitize(st['comm'], 64)
+    if exe_clean and not is_kthread and KTHREAD_LIKE.match(comm):
+        score += 60
+        reasons.append(('Nom de processus usurpant un thread noyau (%s) alors '
+                        'qu\'un binaire est mappé : %s'
+                        % (comm, sanitize(exe_clean, 120)), 60))
+
+    # --- Ligne de commande ---
+    cmdline_raw = read_bytes('%s/cmdline' % proc_dir, limit=16384)
+    cmdline = ''
+    if cmdline_raw:
+        cmdline = sanitize(cmdline_raw.decode('utf-8', 'replace').replace('\x00', ' '), 400)
+        probe = cmdline.replace('"', '').replace("'", '').replace('\\', '')
+        for pattern, label, weight in CMD_PATTERNS:
+            if pattern.search(probe):
+                score += weight
+                reasons.append(('%s : %s' % (label, cmdline[:180]), weight))
+
+    # --- Répertoire courant ---
+    cwd = readlink('%s/cwd' % proc_dir) or ''
+    if cwd.endswith(' (deleted)'):
+        score += 20
+        reasons.append(('Répertoire de travail supprimé : %s' % sanitize(cwd, 120), 20))
+    elif any(cwd.startswith(z) for z in ('/tmp/', '/dev/shm/', '/var/tmp/')) and net_ctx:
+        score += 20
+        reasons.append(('Processus réseau travaillant depuis %s' % sanitize(cwd, 120), 20))
+
+    # --- Statut : uid, capacités, ptrace ---
+    status = parse_proc_status(pid)
+    uid_field = status.get('Uid', '').split()
+    ruid = uid_field[0] if uid_field else '?'
+    euid = uid_field[1] if len(uid_field) > 1 else ruid
+
+    if ruid != '?' and euid != '?' and ruid != euid and euid == '0':
+        score += 35
+        reasons.append(('Élévation de privilèges effective (RUID=%s -> EUID=0)'
+                        % ruid, 35))
+
+    if euid not in ('0', '?'):
+        dangerous = caps_to_names(status.get('CapEff', '0'))
+        if dangerous:
+            weight = 45 if any(c in ('CAP_SYS_MODULE', 'CAP_SYS_ADMIN',
+                                     'CAP_SYS_PTRACE', 'CAP_BPF') for c in dangerous) else 25
+            score += weight
+            reasons.append(('Capacités noyau anormales pour un non-root : %s'
+                            % ', '.join(dangerous), weight))
+
+    tracer = status.get('TracerPid', '0')
+    if tracer not in ('0', ''):
+        score += 30
+        reasons.append(('Processus tracé par le PID %s (injection / debug actif)'
+                        % tracer, 30))
+
+    # --- Namespace réseau (informatif : conteneurs légitimes très fréquents) ---
+    pid_netns = readlink('%s/ns/net' % proc_dir)
+    isolated = bool(init_netns and pid_netns and pid_netns != init_netns)
+    if isolated and net_ctx:
+        score += 10
+        reasons.append(('Namespace réseau isolé (conteneur) : %s' % pid_netns, 10))
+
+    # --- Environnement (LD_PRELOAD & co) ---
+    environ_raw = read_bytes('%s/environ' % proc_dir, limit=65536)
+    if environ_raw:
+        seen_env = set()
+        for var in environ_raw.decode('utf-8', 'replace').split('\x00'):
+            if '=' not in var:
+                continue
+            name, _, value = var.partition('=')
+            name = name.strip()
+            if name in seen_env:
+                continue
+            if name in ENV_CRITICAL and value.strip():
+                seen_env.add(name)
+                if any(sub in value for sub in ENV_ALLOW_SUBSTR):
+                    continue
+                risky = any(value.startswith(z) or z in value for z in EXEC_RED_ZONES) \
+                    or path_is_hidden(value) or '/home/' in value
+                weight = 70 if risky else 40
+                score += weight
+                reasons.append(('Injection de bibliothèque via %s=%s'
+                                % (name, sanitize(value, 160)), weight))
+                for lib in re.split(r'[:\s]+', value):
+                    if lib and os.path.isabs(lib):
+                        digest, _magic = sha256_path(lib, args.max_file_size)
+                        if digest:
+                            hashes.append((digest, lib, 'bibliothèque préchargée'))
+            elif name in ENV_WATCH and value.strip():
+                probe = value.replace('"', '').replace("'", '')
+                for pattern, label, weight in CMD_PATTERNS:
+                    if pattern.search(probe):
+                        seen_env.add(name)
+                        score += min(weight, 50)
+                        reasons.append(('Contenu suspect dans %s : %s'
+                                        % (name, sanitize(value, 160)), min(weight, 50)))
+                        break
+
+    # --- Pondération contextuelle réseau ---
+    if score > 0 and net_ctx:
+        if public_egress:
+            score += 20
+            reasons.append(('Communication sortante vers une IP publique '
+                            '(canal C2 potentiel)', 20))
+        if public_listen:
+            score += 15
+            reasons.append(('Socket en écoute exposé hors loopback (backdoor ?)', 15))
+
+    if score < SEV_MEDIUM:
+        return None
+
+    # --- Empreinte du binaire pour pivot CTI ---
+    # /proc/<pid>/exe reste lisible même si le binaire a été supprimé : c'est
+    # souvent la seule copie récupérable de l'implant.
+    if exe_raw and not exe_clean.startswith(('/memfd:', 'memfd:')):
+        digest, magic = sha256_path('%s/exe' % proc_dir, args.max_file_size,
+                                    nofollow=False)
+        if digest:
+            hashes.append((digest, exe_clean or ('/proc/%s/exe' % pid),
+                           'binaire du PID %s (%s)' % (pid, file_kind(magic))))
+
+    return {
+        'pid': pid,
+        'comm': comm,
+        'uid': ruid,
+        'ppid': st['ppid'],
+        'exe': sanitize(exe or 'introuvable', 200),
+        'cmdline': cmdline or '(vide)',
+        'net': net_ctx,
+        'score': score,
+        'reasons': reasons,
+        'hashes': hashes,
+        'netns': pid_netns,
+    }
+
+
+def enumerate_pids():
+    pids = []
     try:
         with os.scandir('/proc') as entries:
             for entry in entries:
-                pid_str = entry.name
-                if not pid_str.isdigit() or pid_str == '1':
-                    continue
+                if entry.name.isdigit():
+                    pids.append(entry.name)
+    except OSError:
+        pass
+    return pids
 
-                proc_dir = entry.path
+
+def map_network_namespaces(pids):
+    """{ns_id: pid_representatif} — nécessite root pour les autres utilisateurs."""
+    mapping = {}
+    for pid in pids:
+        ns = readlink('/proc/%s/ns/net' % pid)
+        if ns and ns not in mapping:
+            mapping[ns] = pid
+    return mapping
+
+
+def module_processes(args, is_root):
+    out(C.cyan('[*] Étape 1/4 — Cartographie des namespaces et des sockets actifs'))
+    pids = enumerate_pids()
+    netns_map = map_network_namespaces(pids)
+    init_netns = readlink('/proc/1/ns/net')
+    sockets = collect_sockets(netns_map, is_root)
+    out(C.grey('    %d processus visibles, %d namespace(s) réseau, %d socket(s) pertinents'
+               % (len(pids), len(netns_map) or 1, len(sockets))))
+
+    out(C.cyan('[*] Étape 2/4 — Corrélation PID <-> socket et scoring comportemental'))
+    hits = []
+    for pid in pids:
+        try:
+            result = analyse_process(pid, sockets, init_netns, args, is_root)
+        except OSError:
+            continue          # le processus a disparu pendant l'analyse
+        if result:
+            hits.append(result)
+
+    hits.sort(key=lambda h: -h['score'])
+    for hit in hits:
+        label, painter = severity_label(hit['score'])
+        title = ('[%s] PID %s (%s) — score %d'
+                 % (label, hit['pid'], hit['comm'], hit['score']))
+        details = [
+            'PPID        : %s   UID : %s' % (hit['ppid'], hit['uid']),
+            'Binaire     : %s' % hit['exe'],
+            'Cmdline     : %s' % hit['cmdline'],
+        ]
+        if hit['net']:
+            for conn in hit['net'][:8]:
+                details.append('Connexion   : %s' % conn)
+        else:
+            details.append('Connexion   : aucune socket active')
+        for reason, weight in hit['reasons']:
+            details.append('Motif (+%-3d): %s' % (weight, reason))
+        for digest, path, ctx in hit['hashes']:
+            details.append('SHA256      : %s  (%s)' % (digest, ctx))
+            REPORT.add_ioc(digest, path, ctx)
+        REPORT.add(hit['score'], 'PROCESSUS', title, details)
+
+    out(C.grey('    %d processus retenus au-dessus du seuil de bruit' % len(hits)))
+    return pids, sockets
+
+
+# ==========================================================================
+# DÉTECTION DE ROOTKITS / DISSIMULATION
+# ==========================================================================
+
+def collect_all_tids(pids):
+    tids = set(pids)
+    for pid in pids:
+        try:
+            with os.scandir('/proc/%s/task' % pid) as entries:
+                for entry in entries:
+                    if entry.name.isdigit():
+                        tids.add(entry.name)
+        except OSError:
+            continue
+    return tids
+
+
+def detect_hidden_pids(pids):
+    """Un PID accessible par stat() mais absent du listing de /proc trahit un
+    rootkit qui filtre getdents(). Double passe pour éliminer les processus
+    créés pendant le scan (source majeure de faux positifs)."""
+    known = collect_all_tids(pids)
+    raw = read_text('/proc/sys/kernel/pid_max', limit=64)
+    try:
+        pid_max = int((raw or '32768').strip())
+    except ValueError:
+        pid_max = 32768
+    limit = min(pid_max, MAX_PID_BRUTEFORCE)
+
+    candidates = []
+    for pid in range(1, limit + 1):
+        spid = str(pid)
+        if spid in known:
+            continue
+        try:
+            os.stat('/proc/%s' % spid)
+        except OSError:
+            continue
+        candidates.append(spid)
+
+    if not candidates:
+        return [], limit
+
+    # Seconde passe : le processus est-il toujours invisible ET toujours vivant ?
+    known2 = collect_all_tids(enumerate_pids())
+    confirmed = []
+    for spid in candidates:
+        if spid in known2:
+            continue
+        try:
+            os.stat('/proc/%s' % spid)
+        except OSError:
+            continue
+        confirmed.append(spid)
+    return confirmed, limit
+
+
+def detect_module_mismatch():
+    """Compare /proc/modules et /sys/module : un LKM masquant son entrée dans
+    /proc/modules reste souvent visible dans sysfs."""
+    proc_mods = set()
+    content = read_text('/proc/modules', limit=1024 * 1024)
+    if content is None:
+        return None
+    for line in content.splitlines():
+        parts = line.split()
+        if parts:
+            proc_mods.add(parts[0])
+
+    sys_mods = set()
+    try:
+        with os.scandir('/sys/module') as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    # Un module chargé possède un répertoire 'initstate'.
+                    if os.path.exists('/sys/module/%s/initstate' % entry.name):
+                        sys_mods.add(entry.name)
+    except OSError:
+        return None
+    return proc_mods, sys_mods
+
+
+def detect_partial_proc_view():
+    """Un /proc partiel (conteneur, namespace PID tiers) produit des sockets
+    sans propriétaire apparent : il faut le savoir avant de crier au rootkit."""
+    hints = []
+    if os.path.exists('/.dockerenv'):
+        hints.append('/.dockerenv présent')
+    cgroup = read_text('/proc/1/cgroup', limit=65536) or ''
+    if re.search(r'docker|kubepods|containerd|lxc|libpod|garden', cgroup, re.I):
+        hints.append('cgroup de PID 1 de type conteneur')
+    init_pidns = readlink('/proc/1/ns/pid')
+    self_pidns = readlink('/proc/self/ns/pid')
+    if init_pidns and self_pidns and init_pidns != self_pidns:
+        hints.append('namespace PID distinct de celui de PID 1')
+    comm = read_text('/proc/1/comm', limit=256) or ''
+    if comm.strip() not in ('systemd', 'init', 'upstart', 'openrc-init', 'runit', ''):
+        hints.append('PID 1 atypique (%s)' % sanitize(comm, 32))
+    return hints
+
+
+def module_rootkit(pids, sockets, is_root):
+    out(C.cyan('[*] Étape 3/4 — Recherche d\'indicateurs de dissimulation (rootkit)'))
+
+    # 1. Processus cachés
+    hidden, scanned = detect_hidden_pids(pids)
+    if hidden:
+        details = ['Plage inspectée : PID 1 à %d' % scanned]
+        for spid in hidden[:20]:
+            st = parse_proc_stat(spid)
+            comm = sanitize(st['comm'], 48) if st else '?'
+            exe = sanitize(readlink('/proc/%s/exe' % spid) or 'inconnu', 160)
+            details.append('PID caché %s (%s) — binaire : %s' % (spid, comm, exe))
+            digest, magic = sha256_path('/proc/%s/exe' % spid, DEFAULT_MAX_HASH_SIZE,
+                                        nofollow=False)
+            if digest:
+                details.append('SHA256      : %s  (%s)' % (digest, file_kind(magic)))
+                REPORT.add_ioc(digest, exe, 'binaire de processus caché PID %s' % spid)
+        REPORT.add(85, 'ROOTKIT',
+                   '[CRITIQUE] %d processus invisible(s) dans le listing de /proc'
+                   % len(hidden), details)
+
+    # 2. Modules noyau masqués
+    mods = detect_module_mismatch()
+    if mods:
+        proc_mods, sys_mods = mods
+        ghosts = sorted(sys_mods - proc_mods)
+        if ghosts:
+            REPORT.add(80, 'ROOTKIT',
+                       '[CRITIQUE] Module(s) noyau présent(s) dans sysfs mais absent(s) '
+                       'de /proc/modules',
+                       ['Module masqué : %s' % sanitize(m, 64) for m in ghosts[:20]])
+
+    # 3. Taint flags
+    tainted = read_text('/proc/sys/kernel/tainted', limit=64)
+    if tainted:
+        try:
+            flags = int(tainted.strip())
+        except ValueError:
+            flags = 0
+        marks = []
+        if flags & (1 << 0):
+            marks.append('module propriétaire chargé (bit 0)')
+        if flags & (1 << 12):
+            marks.append('module hors-arbre chargé (bit 12)')
+        if flags & (1 << 13):
+            marks.append('module non signé chargé (bit 13)')
+        if flags & (1 << 5):
+            marks.append('erreur machine détectée (bit 5)')
+        if marks:
+            REPORT.add(35, 'ROOTKIT',
+                       '[MOYEN] Noyau marqué "tainted" (valeur %d)' % flags,
+                       marks + ['Corréler avec la liste des modules chargés et '
+                                'la politique de signature de l\'hôte.'])
+
+    # 4. Sockets sans processus propriétaire (root uniquement : sinon les fd
+    #    des autres utilisateurs sont illisibles et tout remonterait en FP).
+    if is_root:
+        owned = set()
+        for pid in pids:
+            owned |= process_socket_inodes(pid)
+        partial_view = detect_partial_proc_view()
+        orphans = []
+        for inode, info in sockets.items():
+            if inode in owned:
+                continue
+            if info['proto'].startswith('udp'):
+                continue
+            if info['state'] not in ('ESTABLISHED', 'LISTEN'):
+                continue
+            # Un socket vu dans un namespace réseau tiers appartient par
+            # construction à un processus potentiellement hors de notre vue.
+            if info.get('netns', 'host') != 'host':
+                continue
+            orphans.append('%s %s %s -> %s (inode %s, uid %s)' % (
+                info['proto'].upper(), info['state'], info['local'],
+                info['remote'], inode, info['uid']))
+        if orphans:
+            score = 40 if partial_view else 65
+            label = 'MOYEN' if partial_view else 'ELEVE'
+            notes = ['Un processus dissimulé ou un handler noyau peut détenir '
+                     'ces sockets.']
+            if partial_view:
+                notes.append('ATTENUATION : vue partielle de /proc détectée (%s). '
+                             'Des processus légitimes hors de ce namespace PID '
+                             'expliquent probablement ces sockets — rejouer '
+                             'depuis l\'hôte pour trancher.'
+                             % ', '.join(partial_view))
+            REPORT.add(score, 'ROOTKIT',
+                       '[%s] %d socket(s) TCP actif(s) sans processus propriétaire '
+                       'identifiable' % (label, len(orphans)),
+                       orphans[:20] + notes)
+    else:
+        out(C.grey('    Corrélation des sockets orphelins ignorée (nécessite root)'))
+
+    # 5. /etc/ld.so.preload
+    preload = read_text('/etc/ld.so.preload', limit=65536)
+    if preload and preload.strip():
+        digest, _magic = sha256_path('/etc/ld.so.preload', DEFAULT_MAX_HASH_SIZE)
+        details = ['Contenu : %s' % sanitize(preload, 300)]
+        if digest:
+            details.append('SHA256      : %s' % digest)
+            REPORT.add_ioc(digest, '/etc/ld.so.preload', 'fichier de préchargement global')
+        for lib in preload.split():
+            lib = lib.strip()
+            if lib and os.path.isabs(lib):
+                ldigest, lmagic = sha256_path(lib, DEFAULT_MAX_HASH_SIZE)
+                if ldigest:
+                    details.append('SHA256      : %s  (%s, %s)'
+                                   % (ldigest, sanitize(lib, 120), file_kind(lmagic)))
+                    REPORT.add_ioc(ldigest, lib, 'bibliothèque préchargée globalement')
+        REPORT.add(75, 'ROOTKIT',
+                   '[CRITIQUE] /etc/ld.so.preload est présent et non vide '
+                   '(hooking userland global)', details)
+
+    out(C.grey('    Contrôles de dissimulation terminés'))
+
+
+# ==========================================================================
+# CHASSE SUR LE SYSTÈME DE FICHIERS
+# ==========================================================================
+
+def build_hunt_roots(is_root, extra_dirs):
+    """Répertoires de prédilection des malwares Linux, adaptés au privilège."""
+    roots = []
+
+    def push(path, depth, cap, tag):
+        if os.path.isdir(path):
+            roots.append({'path': path, 'depth': depth, 'cap': cap, 'tag': tag})
+
+    for path in ('/tmp', '/var/tmp', '/dev/shm', '/run/shm', '/dev/mqueue'):
+        push(path, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FILES_PER_ROOT, 'monde-inscriptible')
+
+    push('/dev', 3, 4000, 'périphériques')
+    for path in ('/usr/local/bin', '/usr/local/sbin', '/usr/local/lib', '/opt'):
+        push(path, 3, 3000, 'installation locale')
+    for path in PERSISTENCE_DIRS:
+        push(path, 2, 500, 'persistance')
+    push('/var/www', 4, 4000, 'exposé web')
+    push('/srv', 4, 4000, 'exposé service')
+
+    # Répertoires utilisateurs
+    homes = []
+    if is_root:
+        passwd = read_text('/etc/passwd', limit=1024 * 1024) or ''
+        for line in passwd.splitlines():
+            parts = line.split(':')
+            if len(parts) >= 6:
                 try:
-                    # 1. Vérification réseau : Le processus a-t-il un socket actif ?
-                    p_sockets = get_process_sockets(pid_str)
-                    network_context = []
-                    for inode in p_sockets:
-                        if inode in active_sockets:
-                            s_info = active_sockets[inode]
-                            network_context.append(f"{s_info['proto'].upper()} {s_info['local']} -> {s_info['remote']}")
+                    uid = int(parts[2])
+                except ValueError:
+                    continue
+                home = parts[5]
+                if (uid == 0 or uid >= 1000) and home.startswith('/') \
+                        and home not in ('/', '/nonexistent', '/dev/null'):
+                    homes.append(home)
+    else:
+        home = os.path.expanduser('~')
+        if home.startswith('/'):
+            homes.append(home)
 
-                    if not network_context:
-                        continue
+    for home in sorted(set(homes)):
+        push(home, 1, 800, 'racine du home')
+        for sub in ('.config', '.local/share', '.local/bin', '.ssh', '.cache',
+                    'bin', '.fonts', '.themes'):
+            push(os.path.join(home, sub), 4, 3000, 'home caché')
 
-                    # 2. Le PID est connecté. Est-il suspect ?
-                    is_anomalous = False
-                    anomaly_reasons = []
-
-                    # A. Namespace Isolation (Évasion Docker/Conteneur)
-                    if is_root and init_ns:
-                        try:
-                            pid_ns = os.readlink(os.path.join(proc_dir, 'ns/net'))
-                            if pid_ns != init_ns:
-                                is_anomalous = True
-                                anomaly_reasons.append(f"Namespace réseau isolé (Conteneur/Sandboxing) : {pid_ns}")
-                        except OSError:
-                            pass
-
-                    # B. Exécution depuis un dossier suspect (Persistance / Dropper)
-                    try:
-                        exe_path = os.readlink(os.path.join(proc_dir, 'exe'))
-                        if any(x in exe_path for x in ['/tmp/', '/dev/shm/', '/.config/', '/.local/']):
-                            is_anomalous = True
-                            anomaly_reasons.append(f"Exécution depuis une zone atypique/cachée : {exe_path}")
-                    except OSError:
-                        pass
-
-                    # C. Analyse des Capacités Linux (Privilege Escalation furtive)
-                    status_raw = safe_read_file(os.path.join(proc_dir, 'status'))
-                    if status_raw:
-                        proc_uid = None
-                        cap_eff = "0000000000000000"
-                        for line in status_raw.splitlines():
-                            if line.startswith('Uid:'):
-                                proc_uid = line.split()[1]
-                            elif line.startswith('CapEff:'):
-                                cap_eff = line.split()[1]
-
-                        # Si le process n'appartient pas à root mais possède des capacités effectives
-                        if proc_uid and proc_uid != '0' and cap_eff != '0000000000000000':
-                            is_anomalous = True
-                            anomaly_reasons.append(f"Privilèges noyau anormaux (Capabilities: {cap_eff}) pour un non-root")
-
-                    # D. Cmdline LotL (Living off the Land)
-                    cmdline_raw = safe_read_file(os.path.join(proc_dir, 'cmdline'))
-                    if cmdline_raw:
-                        cmdline = sanitize_str(cmdline_raw)
-                        for keyword in SUSPICIOUS_CMD_KEYWORDS:
-                            if keyword in cmdline.replace("'", "").replace('"', "").replace("\\", ""):
-                                is_anomalous = True
-                                anomaly_reasons.append(f"Mot-clé cmdline suspect ({keyword}) : {cmdline[:80]}...")
-                                break
-
-                    # E. Injections (LD_PRELOAD)
-                    environ_raw = safe_read_file(os.path.join(proc_dir, 'environ'))
-                    if environ_raw:
-                        for var in environ_raw.split('\x00'):
-                            for bad_env in SUSPICIOUS_ENV_VARS:
-                                if bad_env in var:
-                                    is_anomalous = True
-                                    anomaly_reasons.append(f"Injection environnementale : {sanitize_str(var)}")
-                                    break
-
-                    # 3. VERDICT
-                    if is_anomalous:
-                        proc_name = safe_read_file(os.path.join(proc_dir, 'comm'))
-                        proc_name = sanitize_str(proc_name) if proc_name else "Unknown"
-
-                        print(f"{RED}{BOLD}[!] COMPROMISSION RÉSEAU ACTIVE DÉTECTÉE (PID: {pid_str} | {proc_name}){RESET}")
-                        print(f"{RED} ├─ Connexion(s) : {', '.join(network_context)}{RESET}")
-                        for reason in anomaly_reasons:
-                            print(f"{RED} └─ Motif        : {reason}{RESET}")
-                        print("")
-                        found = True
-
-                except (IOError, OSError):
-                    pass
+    # Sessions utilisateurs (tmpfs volatil, très prisé des implants)
+    try:
+        with os.scandir('/run/user') as entries:
+            for entry in entries:
+                if entry.name.isdigit():
+                    push(entry.path, 3, 2000, 'session tmpfs')
     except OSError:
         pass
 
-    if not found:
-        print(f"{BOLD}[+] Scan terminé : Aucun comportement réseau anormal détecté.{RESET}")
+    for path in extra_dirs or []:
+        push(path, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FILES_PER_ROOT, 'fourni par l\'analyste')
 
-# ==========================================
-# MAIN ROUTINE
-# ==========================================
+    # Déduplication par chemin réel
+    seen = set()
+    unique = []
+    for root in roots:
+        key = os.path.realpath(root['path'])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
 
-def main():
-    is_root = (os.geteuid() == 0)
 
-    print(f"{YELLOW}=" * 70)
-    print("      DFIR LINUX SNIPER - NETWORK & PROCESS CORRELATOR")
-    print("=" * 70 + f"{RESET}")
+SKIP_DIR_NAMES = {
+    'node_modules', '.git', '.svn', '__pycache__', 'site-packages',
+    'dist-packages', '.cargo', '.rustup', '.nvm', '.npm', '.m2', '.gradle',
+    'mozilla', 'chromium', 'google-chrome', 'BraveSoftware', 'thunderbird',
+}
+SKIP_ABS_DIRS = {'/proc', '/sys', '/dev/pts', '/dev/fd', '/run/systemd/inaccessible'}
 
-    if is_root:
-        print(f"{RED}[!] PRIVILÈGES : ROOT (Périmètre total & Analyse Namespaces){RESET}")
-    else:
-        print(f"{CYAN}[*] PRIVILÈGES : STANDARD (Certaines vérifications nécessitent Root){RESET}")
-    print(f"{YELLOW}=" * 70 + f"{RESET}")
 
-    # --- BLOC DE CONFIRMATION ---
-    while True:
-        choice = input("\nVoulez-vous engager le tir de précision sur ce périmètre ? (y/n) : ").strip().lower()
-        if choice == 'y':
-            print(f"\n{CYAN}[+] Déverrouillage et démarrage de la collecte chirurgicale...{RESET}\n")
-            break
-        elif choice == 'n':
-            print("[-] Annulation. Sécurité maintenue, fin du script.")
-            sys.exit(0)
+def score_file(entry_path, st, magic, root_tag, name):
+    """Pondération d'un artefact fichier. Retourne (score, [motifs])."""
+    score = 0
+    reasons = []
+    hidden = name.startswith('.')
+    kind = file_kind(magic)
+    executable = bool(st.st_mode & 0o111)
+    in_tmp = any(entry_path.startswith(z) for z in
+                 ('/tmp/', '/var/tmp/', '/dev/shm/', '/run/shm/', '/dev/mqueue/'))
+
+    if st.st_mode & stat.S_ISUID:
+        score += 70
+        reasons.append('Bit SUID positionné (propriétaire UID %d)' % st.st_uid)
+    if st.st_mode & stat.S_ISGID and executable:
+        score += 35
+        reasons.append('Bit SGID positionné (groupe GID %d)' % st.st_gid)
+
+    if kind == 'ELF':
+        if in_tmp:
+            score += 60
+            reasons.append('Binaire ELF dans un répertoire temporaire')
+        elif hidden:
+            score += 55
+            reasons.append('Binaire ELF portant un nom caché')
+        elif entry_path.startswith('/dev/'):
+            score += 70
+            reasons.append('Binaire ELF stocké sous /dev')
+        elif root_tag in ('exposé web', 'exposé service'):
+            score += 45
+            reasons.append('Binaire ELF dans une arborescence exposée')
         else:
-            print("Entrée invalide, veuillez taper 'y' ou 'n'.")
-    # ----------------------------------------
+            score += 20
+            reasons.append('Binaire ELF hors chemin système standard')
+    elif kind == 'SCRIPT' and (in_tmp or hidden) and executable:
+        score += 35
+        reasons.append('Script exécutable %s' % ('caché' if hidden else 'temporaire'))
+    elif executable and in_tmp:
+        score += 30
+        reasons.append('Fichier exécutable dans un répertoire temporaire')
+    elif hidden and in_tmp:
+        score += 25
+        reasons.append('Fichier caché dans un répertoire temporaire')
 
-    hunt_c2_and_anomalies(is_root)
+    if entry_path.startswith('/dev/') and stat.S_ISREG(st.st_mode) \
+            and not entry_path.startswith(('/dev/shm/', '/dev/mqueue/')):
+        score += 45
+        reasons.append('Fichier régulier sous /dev (hors tmpfs légitime)')
 
-if __name__ == "__main__":
-    sys.stdout.reconfigure(line_buffering=True)
-    main()
+    # Noms de dissimulation classiques
+    if re.match(r'^\.{2,}$|^\s|\s$|^\.\s', name) or '\u200b' in name or '\u202e' in name:
+        score += 40
+        reasons.append('Nom de fichier conçu pour la dissimulation visuelle')
+    if re.match(r'^\.(X11|ICE|font|Test|cache)-?(unix|lock)?$', name) and stat.S_ISREG(st.st_mode):
+        score += 30
+        reasons.append('Nom mimant un socket système classique')
+
+    # Clés SSH et cron : persistance
+    if name == 'authorized_keys':
+        score += 30
+        reasons.append('Point de persistance SSH — vérifier chaque clé')
+
+    return score, reasons
+
+
+def scan_root(root, args, budget):
+    """Parcours borné, sans franchir de point de montage, sans suivre de lien."""
+    findings = []
+    base = root['path']
+    try:
+        base_st = os.lstat(base)
+    except OSError:
+        return findings
+    base_dev = base_st.st_dev
+    seen_files = 0
+    stack = [(base, 0)]
+
+    while stack:
+        current, depth = stack.pop()
+        if depth > root['depth'] or seen_files >= root['cap'] or budget['left'] <= 0:
+            continue
+        if os.path.realpath(current) in SKIP_ABS_DIRS:
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+
+        for entry in entries:
+            if seen_files >= root['cap'] or budget['left'] <= 0:
+                break
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+
+            if st.st_dev != base_dev:
+                continue                     # ne franchit pas les montages
+            name = entry.name
+
+            if stat.S_ISDIR(st.st_mode):
+                if name in SKIP_DIR_NAMES:
+                    continue
+                stack.append((entry.path, depth + 1))
+                continue
+
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                # FIFO, socket, device : jamais ouverts, mais un device inattendu
+                # dans /tmp mérite d'être signalé.
+                if (stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode)) \
+                        and not entry.path.startswith('/dev/'):
+                    findings.append({
+                        'path': entry.path, 'st': st, 'score': 55,
+                        'reasons': ['Fichier de périphérique hors de /dev'],
+                        'digest': None, 'kind': 'DEVICE',
+                    })
+                continue
+
+            seen_files += 1
+            budget['left'] -= 1
+
+            # Pré-filtre bon marché avant toute lecture : on ne lit un fichier
+            # que s'il est un candidat plausible.
+            hidden = name.startswith('.')
+            executable = bool(st.st_mode & 0o111)
+            in_tmp = any(entry.path.startswith(z) for z in
+                         ('/tmp/', '/var/tmp/', '/dev/shm/', '/run/shm/',
+                          '/dev/mqueue/', '/dev/'))
+            special = bool(st.st_mode & (stat.S_ISUID | stat.S_ISGID))
+            persistence = root['tag'] == 'persistance' or name == 'authorized_keys'
+            if not (hidden or executable or in_tmp or special or persistence):
+                continue
+            if st.st_size == 0 and not special:
+                continue
+
+            magic = read_bytes(entry.path, limit=8, require_regular=True) or b''
+            score, reasons = score_file(entry.path, st, magic, root['tag'], name)
+
+            # Contenu des scripts déposés en zone temporaire : un dropper y est
+            # souvent en clair et doit remonter en CRITIQUE, pas en MOYEN.
+            if (file_kind(magic) == 'SCRIPT' or name.endswith(
+                    ('.sh', '.py', '.pl', '.php', '.rb'))) \
+                    and in_tmp and st.st_size < 256 * 1024:
+                content = read_text(entry.path, limit=256 * 1024) or ''
+                probe = content[:REGEX_PROBE_LIMIT].replace('"', '').replace("'", '')
+                for pattern, label, weight in CMD_PATTERNS:
+                    if pattern.search(probe):
+                        score += weight
+                        reasons.append('Contenu du script — %s' % label)
+                        break
+
+            if root['tag'] == 'persistance' and st.st_size < 256 * 1024:
+                content = (read_text(entry.path, limit=256 * 1024)
+                           or '')[:REGEX_PROBE_LIMIT]
+                distro_owned = (st.st_uid == 0 and not (st.st_mode & stat.S_IWOTH))
+                if PERSISTENCE_STRONG.search(content):
+                    score += 55
+                    reasons.append('Contenu de persistance à haut risque '
+                                   '(shell distant, décodage exécuté ou zone temporaire)')
+                elif PERSISTENCE_WEAK.search(content) and not distro_owned:
+                    score += 30
+                    reasons.append('Tâche planifiée non maîtrisée appelant '
+                                   'réseau/décodage (propriétaire UID %d)' % st.st_uid)
+
+            if score < args.min_file_score:
+                continue
+
+            digest = None
+            if not args.no_hash:
+                digest, magic2 = sha256_path(entry.path, args.max_file_size)
+                if magic2 and not magic:
+                    magic = magic2
+
+            findings.append({
+                'path': entry.path, 'st': st, 'score': score,
+                'reasons': reasons, 'digest': digest, 'kind': file_kind(magic),
+            })
+    return findings
+
+
+def hash_persistence_files():
+    results = []
+    for path in PERSISTENCE_FILES:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        digest, magic = sha256_path(path, DEFAULT_MAX_HASH_SIZE)
+        if digest:
+            results.append((digest, path, st, file_kind(magic)))
+    return results
+
+
+def module_filesystem(args, is_root):
+    out(C.cyan('[*] Étape 4/4 — Chasse aux artefacts sur les répertoires à risque'))
+    roots = build_hunt_roots(is_root, args.extra_dir)
+    out(C.grey('    %d racine(s) inspectée(s) — profondeur max %d, budget %d fichiers'
+               % (len(roots), DEFAULT_MAX_DEPTH, GLOBAL_FILE_BUDGET)))
+
+    budget = {'left': GLOBAL_FILE_BUDGET}
+    all_findings = []
+    for root in roots:
+        all_findings.extend(scan_root(root, args, budget))
+
+    all_findings.sort(key=lambda f: -f['score'])
+    for item in all_findings:
+        st = item['st']
+        label, _painter = severity_label(item['score'])
+        title = '[%s] %s — score %d' % (label, sanitize(item['path'], 200), item['score'])
+        details = [
+            'Type        : %s   Taille : %s   Mode : %s'
+            % (item['kind'], fmt_size(st.st_size), oct(st.st_mode & 0o7777)),
+            'Propriétaire: UID %d / GID %d' % (st.st_uid, st.st_gid),
+            'Modifié le  : %s   (ctime %s)' % (fmt_time(st.st_mtime), fmt_time(st.st_ctime)),
+        ]
+        for reason in item['reasons']:
+            details.append('Motif       : %s' % reason)
+        if item['digest'] and item['digest'].startswith('NON-CALCULE'):
+            details.append('SHA256      : %s — relancer avec --max-file-size '
+                           'pour empreinter cet artefact' % item['digest'])
+        elif item['digest']:
+            details.append('SHA256      : %s' % item['digest'])
+            REPORT.add_ioc(item['digest'], item['path'], 'artefact %s' % item['kind'])
+        elif not args.no_hash:
+            details.append('SHA256      : non calculable (lecture refusée)')
+        REPORT.add(item['score'], 'FICHIER', title, details)
+
+    # Fichiers de persistance systématiquement empreintés (valeur CTI/baseline)
+    for digest, path, st, kind in hash_persistence_files():
+        REPORT.add_ioc(digest, path, 'fichier de persistance (référence)')
+        REPORT.add(SEV_MEDIUM - 5, 'PERSISTANCE',
+                   '[INFO] Empreinte de référence : %s' % path,
+                   ['Type        : %s   Modifié le : %s' % (kind, fmt_time(st.st_mtime)),
+                    'SHA256      : %s' % digest])
+
+    out(C.grey('    %d artefact(s) retenu(s), %d fichier(s) empreinté(s)'
+               % (len(all_findings), _STATS['hashed'])))
+
+
+# ==========================================================================
+# RESTITUTION
+# ==========================================================================
+
+def render(args, is_root, elapsed):
+    out('')
+    out(C.yellow('=' * 78))
+    out(C.bold('  RESULTATS'))
+    out(C.yellow('=' * 78))
+
+    findings = REPORT.sorted_findings(args.min_score)
+    if not findings:
+        out(C.green('[+] Aucun indicateur au-dessus du seuil %d.' % args.min_score))
+        out(C.grey('    Absence de détection != absence de compromission : ce script '
+                   'ne couvre ni la mémoire noyau ni les journaux.'))
+    else:
+        by_cat = {}
+        for finding in findings:
+            by_cat.setdefault(finding['category'], []).append(finding)
+        for category in ('ROOTKIT', 'PROCESSUS', 'FICHIER', 'PERSISTANCE'):
+            items = by_cat.get(category)
+            if not items:
+                continue
+            out('')
+            out(C.bold('--- %s (%d) ---' % (category, len(items))))
+            for finding in items:
+                _label, painter = severity_label(finding['score'])
+                out('')
+                out(painter(finding['title']))
+                for line in finding['details']:
+                    out('    %s' % line)
+
+    # Table IoC : le livrable directement exploitable en CTI
+    if REPORT.iocs:
+        out('')
+        out(C.yellow('=' * 78))
+        out(C.bold('  EMPREINTES SHA256 COLLECTEES (pivot CTI)'))
+        out(C.yellow('=' * 78))
+        out(C.grey('Inclut les artefacts retenus sous le seuil d\'affichage : '
+                   'soumettre l\'ensemble aux sources CTI avant de conclure.'))
+        for digest, path, ctx in REPORT.iocs:
+            out('%s  %s' % (digest, sanitize(path, 150)))
+            out(C.grey('%s  %s' % (' ' * 64, ctx)))
+
+    out('')
+    out(C.yellow('-' * 78))
+    out('Durée : %.1fs | Fichiers empreintés : %d (%s) | Lectures refusées : %d'
+        % (elapsed, _STATS['hashed'], fmt_size(_STATS['hash_bytes']),
+           _STATS['read_denied']))
+    out('Ouvertures O_NOATIME : %d | Repli sans O_NOATIME (atime modifié) : %d'
+        % (_STATS['noatime_ok'], _STATS['noatime_fallback']))
+    if not is_root:
+        out(C.grey('Périmètre partiel : namespaces, fd des autres utilisateurs, '
+                   'environ distant et homes tiers non lisibles en utilisateur standard.'))
+    out(C.yellow('-' * 78))
+
+
+# ==========================================================================
+# BANNIÈRE, AVERTISSEMENT ET CONFIRMATION
+# ==========================================================================
+
+def banner(is_root, args):
+    out(C.yellow('=' * 78))
+    out(C.bold('      DFIR LINUX SNIPER v%s — NETWORK / PROCESS / FILESYSTEM CORRELATOR'
+               % VERSION))
+    out(C.yellow('=' * 78))
+    if is_root:
+        out(C.red('[!] PRIVILEGES : ROOT — périmètre complet '
+                  '(namespaces, fd globaux, homes, capacités)'))
+    else:
+        out(C.cyan('[*] PRIVILEGES : UTILISATEUR STANDARD — périmètre restreint '
+                   'aux objets lisibles par UID %d' % os.getuid()))
+        out(C.grey('    Les processus tiers, leurs fd et les autres homes resteront '
+                   'invisibles : une exécution root est recommandée en IR.'))
+    out(C.yellow('=' * 78))
+    out('')
+    out(C.bold('AVERTISSEMENT — LIRE AVANT DE LANCER LA COLLECTE'))
+    out('  1. Lecture seule : aucune écriture disque, aucun réseau, aucun signal '
+        'envoyé, aucun module chargé.')
+    out('  2. Les fichiers sont ouverts avec O_NOATIME quand c\'est permis ; sinon '
+        'l\'atime des fichiers lus est mis à jour (trace mineure).')
+    out('  3. Le calcul SHA256 consomme du CPU et des I/O : impact possible sur un '
+        'hôte de production chargé.')
+    out('  4. Sur une machine compromise, le noyau peut mentir : ces résultats sont '
+        'des indicateurs, pas un verdict. Confirmer par une acquisition mémoire.')
+    out('  5. Les sorties peuvent contenir des données sensibles (cmdline, chemins '
+        'utilisateurs) : traiter le transcript comme une pièce à conviction.')
+    out('  6. Ordre d\'acquisition : capturer la RAM et le réseau AVANT ce scan si '
+        'la volatilité prime.')
+    out('')
+
+
+def confirm(args):
+    if args.yes:
+        out(C.cyan('[+] Consentement fourni via --yes : démarrage de la collecte.'))
+        return True
+    if not sys.stdin.isatty():
+        out(C.red('[-] Entrée standard non interactive et --yes absent : '
+                  'annulation par sécurité.'))
+        return False
+    while True:
+        try:
+            choice = input('\nEngager la collecte en lecture seule sur ce périmètre ? '
+                           '(y/n) : ').strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            out('')
+            out('[-] Annulation.')
+            return False
+        if choice in ('y', 'yes', 'o', 'oui'):
+            out('')
+            out(C.cyan('[+] Démarrage de la collecte chirurgicale...'))
+            out('')
+            return True
+        if choice in ('n', 'no', 'non'):
+            out('[-] Annulation. Aucun accès effectué, fin du script.')
+            return False
+        out('Entrée invalide, tapez \'y\' ou \'n\'.')
+
+
+# ==========================================================================
+# MAIN
+# ==========================================================================
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog='linux_forensics.py',
+        description='Live forensics Linux sans dépendance : corrélation '
+                    'réseau/processus, détection de rootkit et collecte de '
+                    'SHA256 pour pivot CTI.',
+        epilog='Exécution en lecture seule. Aucune donnée n\'est écrite sur le '
+               'disque : rediriger la sortie vers un collecteur distant.')
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='consentement explicite (IR automatisée) ; '
+                             'l\'avertissement reste affiché')
+    parser.add_argument('--no-color', action='store_true',
+                        help='désactive les séquences ANSI')
+    parser.add_argument('--no-fs', action='store_true',
+                        help='ignore la chasse sur le système de fichiers')
+    parser.add_argument('--no-rootkit', action='store_true',
+                        help='ignore les contrôles de dissimulation')
+    parser.add_argument('--no-hash', action='store_true',
+                        help='n\'empreinte aucun fichier (scan très rapide)')
+    parser.add_argument('--min-score', type=int, default=SEV_MEDIUM,
+                        help='seuil d\'affichage des constats (défaut : %d)' % SEV_MEDIUM)
+    parser.add_argument('--min-file-score', type=int, default=25,
+                        help='seuil de rétention d\'un artefact fichier (défaut : 25)')
+    parser.add_argument('--max-file-size', type=int, default=DEFAULT_MAX_HASH_SIZE,
+                        help='taille maximale empreintée en octets (défaut : 128 Mo)')
+    parser.add_argument('--extra-dir', action='append', metavar='CHEMIN',
+                        help='répertoire supplémentaire à inspecter (répétable)')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    global C
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+
+    use_color = sys.stdout.isatty() and not args.no_color and \
+        os.environ.get('TERM', '') not in ('', 'dumb')
+    C = Palette(use_color)
+
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(line_buffering=True, errors='replace')
+        except (ValueError, OSError):
+            pass
+
+    try:
+        is_root = (os.geteuid() == 0)
+    except AttributeError:
+        out('[-] Plateforme non POSIX : ce script cible Linux uniquement.')
+        return 2
+
+    if not os.path.isdir('/proc/1'):
+        out('[-] /proc est indisponible : impossible de conduire l\'analyse.')
+        return 2
+
+    banner(is_root, args)
+    if not confirm(args):
+        return 0
+
+    start = time.time()
+    try:
+        pids, sockets = module_processes(args, is_root)
+        if not args.no_rootkit:
+            module_rootkit(pids, sockets, is_root)
+        else:
+            out(C.grey('[*] Étape 3/4 ignorée (--no-rootkit)'))
+        if not args.no_fs:
+            module_filesystem(args, is_root)
+        else:
+            out(C.grey('[*] Étape 4/4 ignorée (--no-fs)'))
+    except KeyboardInterrupt:
+        out('')
+        out(C.yellow('[!] Interruption analyste : restitution des constats partiels.'))
+    render(args, is_root, time.time() - start)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            os.close(sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(0)
