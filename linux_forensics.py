@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-linux_forensics.py - DFIR LINUX SNIPER v2.0
+linux_forensics.py - DFIR LINUX SNIPER v2.1
 Corrélateur Réseau / Processus / Système de fichiers pour live forensics Linux.
 
 Contraintes de conception (inchangées) :
@@ -14,6 +14,30 @@ Contraintes de conception (inchangées) :
 
 Sortie : indicateurs pondérés + SHA256 de chaque artefact retenu, pour
 pivot CTI (VirusTotal / MISP / OpenCTI / MalwareBazaar).
+
+Changelog v2.1
+--------------
+Faux positifs corrigés (remontés du terrain, Kali/XFCE) :
+  * `xfsettingsd`, `mdadm`, `watchdogd` qualifiés d'usurpation de thread noyau :
+    la regex matchait des préfixes nus (xfs, md, watchdog). Un thread noyau est
+    désormais reconnu par sa forme réelle (nom contenant '/', nom exact figé,
+    ou crochet initial).
+  * `sudo`, `su`, `pkexec`, `fusermount3` signalés en élévation de privilèges :
+    RUID != EUID = 0 EST le mécanisme setuid. La règle ne se déclenche plus que
+    si le binaire ne porte PAS le bit setuid — le cas réellement anormal.
+  * Noeuds `chr`/`blk` de systemd (`/run/user/<uid>/systemd/inaccessible/`)
+    qualifiés de périphérique hors /dev : allowlist de ces chemins.
+  * Toute liste d'IoC ou outil de sécurité posé en zone temporaire (ce script
+    y compris) matchait ses propres motifs : au-delà de 4 techniques cumulées,
+    le fichier est traité comme une liste d'IoC et n'est plus scoré.
+  * Bit SUID pondéré selon la zone : critique en /tmp ou chemin caché,
+    signalé sans dramatiser dans /usr/local/bin ou /opt.
+Correctifs :
+  * `curl|wget -o` (minuscule) et redirection `>` vers /tmp ignorés par le motif
+    de téléchargement, qui n'acceptait que `-O`.
+  * Le hachage ne renvoie plus jamais d'empreinte tronquée en cas de lecture
+    interrompue : abandon explicite plutôt qu'un SHA256 faux.
+  * Auto-exclusion du scanner de sa propre chasse fichiers.
 
 Changelog v2.0
 --------------
@@ -53,7 +77,7 @@ import stat
 import sys
 import time
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 # ==========================================================================
 # CONFIGURATION & IoC
@@ -67,6 +91,11 @@ DEFAULT_MAX_DEPTH = 6
 DEFAULT_MAX_FILES_PER_ROOT = 8000
 GLOBAL_FILE_BUDGET = 60000
 REGEX_PROBE_LIMIT = 64 * 1024        # borne les moteurs regex (anti-ReDoS sur fichier gonflé)
+CONTENT_SCAN_MAX = 256 * 1024        # taille max d'un script dont on lit le contenu
+IOC_LIST_THRESHOLD = 4               # au-delà : liste d'IoC, pas un payload
+DEFAULT_MAX_FILE_FINDINGS = 150      # artefacts fichiers restitués en détail
+DEFAULT_MAX_HASH_FILES = 2000        # plafond global de fichiers empreintés
+MAX_IOC_ROWS = 500                   # lignes de la table de pivot CTI
 MAX_PID_BRUTEFORCE = 131072
 
 # --- Seuils de scoring (réduction des faux positifs) ---
@@ -82,7 +111,8 @@ CMD_PATTERNS = [
      "Netcat avec exécution de commande (-e/-c)", 65),
     (re.compile(r'\b(curl|wget)\b[^;|&]{0,160}\|\s*(ba|z|k|da)?sh\b'),
      "Téléchargement redirigé vers un interpréteur (dropper)", 70),
-    (re.compile(r'\b(curl|wget)\b[^;|&]{0,160}\s-O\s*/(tmp|dev/shm|var/tmp)/'),
+    (re.compile(r'\b(curl|wget)\b[^;|&]{0,160}(\s(-o|-O|--output(-document)?)\s*|'
+                r'\s*>\s*)/(tmp|dev/shm|var/tmp|run/shm)/', re.I),
      "Téléchargement vers un répertoire monde-inscriptible", 55),
     (re.compile(r'\bpython[0-9.]*\s+-c\b.{0,300}?(socket\.socket|pty\.spawn|os\.dup2|'
                 r'SOCK_STREAM|connect\()', re.S),
@@ -100,7 +130,7 @@ CMD_PATTERNS = [
     (re.compile(r'\bbase64\s+(-d|--decode)\b[^;|&]{0,120}\|\s*(ba|z|k|da)?sh\b'),
      "Payload base64 décodé puis exécuté", 70),
     (re.compile(r'\b(bash|sh|zsh|ksh)\s+-[a-z]*i\b'),
-     "Shell interactif lancé en ligne de commande", 30),
+     "Shell interactif lancé en ligne de commande", 20),
     (re.compile(r'\bhistory\s+-c\b|\bunset\s+HISTFILE\b|HISTFILE=/dev/null|HISTSIZE=0'),
      "Anti-forensic : neutralisation de l'historique shell", 55),
     (re.compile(r'\bchattr\s+[+-]i\b'),
@@ -116,8 +146,9 @@ CMD_PATTERNS = [
      "Nom associé à un malware/cryptominer Linux connu", 85),
     (re.compile(r'--donate-level|stratum\+tcp://|pool\.(minexmr|supportxmr|nanopool)', re.I),
      "Configuration de pool de minage", 85),
-    (re.compile(r'\b(chmod|chown)\s+[+7]?[0-7]{0,4}s?\s+/(tmp|dev/shm|var/tmp)/'),
-     "Modification de permissions dans un répertoire temporaire", 35),
+    (re.compile(r'\bchmod\s+([0-7]*[1357][0-7]{0,2}|[ugoa]*[+=][rw]*[xs][rws]*)'
+                r'\s+/(tmp|dev/shm|var/tmp)/'),
+     "Attribution du bit d'exécution dans un répertoire temporaire", 20),
 ]
 
 # --- Variables d'environnement à haut risque ---
@@ -152,10 +183,31 @@ DANGEROUS_CAPS = {
 }
 
 # --- Noms de threads noyau usurpés par les rootkits userland ---
-KTHREAD_LIKE = re.compile(
-    r'^\[?(kworker|ksoftirqd|kthreadd|migration|rcu_|watchdog|kswapd|'
-    r'kcompactd|khugepaged|kdevtmpfs|kaudit|kintegrity|jbd2|ext4-|'
-    r'irq/|scsi_|md|xfs)', re.I)
+# Un vrai thread noyau porte soit un nom contenant '/' (kworker/0:1,
+# jbd2/sda1-8, irq/24-pciehp), soit un nom figé de la liste exacte ci-dessous.
+# Les préfixes nus sont proscrits : 'xfs' matchait xfsettingsd, 'md' matchait
+# mdadm, 'watchdog' matchait watchdogd (démons userland parfaitement légitimes).
+KTHREAD_SLASHED = re.compile(
+    r'^(kworker|ksoftirqd|migration|watchdog|irq|rcu[a-z_]*|jbd2|xfs-|xfsaild|'
+    r'scsi_eh|scsi_tmf|dm-|md\d*_|writeback|ext4-|btrfs-|nfsd|kdmflush|'
+    r'loop\d+|card\d+-|nvme-|cpuhp|idle_inject|ksmd)/')
+KTHREAD_EXACT = re.compile(
+    r'^(kthreadd|kswapd\d*|khugepaged|kcompactd\d*|kdevtmpfs|oom_reaper|'
+    r'khungtaskd|kauditd|kblockd|kintegrityd|kverityd|ksmd|kdamond|kthrotld|'
+    r'netns|kstrp|edac-poller|devfreq_wq|inet_frag_wq|kmpath_rdacd|kmpathd|'
+    r'acpi_thermal_pm|ipv6_addrconf|cryptd|zswap-shrink|charger_manager|'
+    r'xfsalloc|xfs_mru_cache|kcompactd|khubd|kaluad|kmpath_handlerd|'
+    r'scsi_eh_\d+|scsi_tmf_\d+|md\d+_[a-z0-9]+|nvme-[a-z-]+wq|raid\d+wq|'
+    r'dm_bufio_cache|tpm_dev_wq|blkcg_punt_bio|led_workqueue|ata_sff)$')
+
+
+def looks_like_kthread_name(comm):
+    """Le nom imite-t-il un thread noyau ? Trois formes seulement."""
+    if comm.startswith('['):
+        return True
+    if '/' in comm and KTHREAD_SLASHED.match(comm):
+        return True
+    return bool(KTHREAD_EXACT.match(comm))
 
 # --- Fichiers de persistance systématiquement empreintés ---
 PERSISTENCE_FILES = (
@@ -177,6 +229,18 @@ PERSISTENCE_STRONG = re.compile(
     r'(/tmp/|/dev/shm/|/var/tmp/)[\w.\-]*\s*(&|;|$)', re.I | re.M)
 PERSISTENCE_WEAK = re.compile(
     r'\b(curl|wget)\b|\bbase64\b|\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b', re.I)
+
+# --- Noeuds de périphérique légitimes hors /dev ---
+# systemd crée chr/blk/fifo/sock/dir/reg en mode 0000 dans
+# /run/systemd/inaccessible/ et /run/user/<uid>/systemd/inaccessible/ pour
+# masquer des chemins via les unités (InaccessiblePaths=).
+BENIGN_DEVICE_NODES = re.compile(
+    r'(^|/)(run/)?(user/\d+/)?systemd/inaccessible/(chr|blk|fifo|sock|dir|reg)$')
+
+
+def is_benign_device_node(path):
+    return bool(BENIGN_DEVICE_NODES.search(path))
+
 
 # --- Magies de fichiers ---
 MAGIC_ELF = b'\x7fELF'
@@ -340,11 +404,17 @@ def sha256_fd(fd, size_hint, max_size):
     h = hashlib.sha256()
     magic = b''
     total = 0
+    stalls = 0
     while True:
         try:
             chunk = os.read(fd, HASH_CHUNK)
         except (BlockingIOError, InterruptedError):
-            break
+            # Une empreinte partielle présentée comme valide serait pire que
+            # pas d'empreinte du tout : on abandonne plutôt que de tronquer.
+            stalls += 1
+            if stalls > 16:
+                return None, magic
+            continue
         except OSError:
             return None, magic
         if not chunk:
@@ -627,6 +697,21 @@ def path_is_hidden(path):
                for part in path.split('/') if part)
 
 
+def exe_privilege_state(pid):
+    """'setuid-root' / 'setgid' / 'plain' / 'unknown' pour le binaire mappé.
+    Passe par /proc/<pid>/exe : donne l'inode réel même si le fichier a été
+    supprimé, et évite toute course sur le chemin."""
+    try:
+        st = os.stat('/proc/%s/exe' % pid)
+    except OSError:
+        return 'unknown'
+    if st.st_mode & stat.S_ISUID and st.st_uid == 0:
+        return 'setuid-root'
+    if st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        return 'setgid'
+    return 'plain'
+
+
 def analyse_process(pid, sockets, init_netns, args, is_root):
     """Analyse un PID et retourne un dict de constat si le score est retenu."""
     proc_dir = '/proc/%s' % pid
@@ -689,7 +774,7 @@ def analyse_process(pid, sockets, init_netns, args, is_root):
 
     # --- Usurpation d'identité de thread noyau ---
     comm = sanitize(st['comm'], 64)
-    if exe_clean and not is_kthread and KTHREAD_LIKE.match(comm):
+    if exe_clean and not is_kthread and looks_like_kthread_name(comm):
         score += 60
         reasons.append(('Nom de processus usurpant un thread noyau (%s) alors '
                         'qu\'un binaire est mappé : %s'
@@ -722,9 +807,14 @@ def analyse_process(pid, sockets, init_netns, args, is_root):
     euid = uid_field[1] if len(uid_field) > 1 else ruid
 
     if ruid != '?' and euid != '?' and ruid != euid and euid == '0':
-        score += 35
-        reasons.append(('Élévation de privilèges effective (RUID=%s -> EUID=0)'
-                        % ruid, 35))
+        # sudo, su, pkexec, fusermount3, mount, ping... produisent tous
+        # RUID != EUID = 0 par construction : c'est le mécanisme setuid, pas une
+        # anomalie. Seul un binaire SANS bit setuid tournant en EUID=0 l'est.
+        privilege = exe_privilege_state(pid)
+        if privilege == 'plain':
+            score += 45
+            reasons.append(('EUID=0 (RUID=%s) alors que le binaire ne porte pas '
+                            'le bit setuid : élévation obtenue autrement' % ruid, 45))
 
     if euid not in ('0', '?'):
         dangerous = caps_to_names(status.get('CapEff', '0'))
@@ -1187,6 +1277,11 @@ SKIP_DIR_NAMES = {
 }
 SKIP_ABS_DIRS = {'/proc', '/sys', '/dev/pts', '/dev/fd', '/run/systemd/inaccessible'}
 
+try:
+    SELF_PATH = os.path.realpath(os.path.abspath(__file__))
+except (NameError, OSError):
+    SELF_PATH = ''
+
 
 def score_file(entry_path, st, magic, root_tag, name):
     """Pondération d'un artefact fichier. Retourne (score, [motifs])."""
@@ -1199,8 +1294,18 @@ def score_file(entry_path, st, magic, root_tag, name):
                  ('/tmp/', '/var/tmp/', '/dev/shm/', '/run/shm/', '/dev/mqueue/'))
 
     if st.st_mode & stat.S_ISUID:
-        score += 70
-        reasons.append('Bit SUID positionné (propriétaire UID %d)' % st.st_uid)
+        # Un SUID en zone monde-inscriptible ou cachée est une porte dérobée ;
+        # dans /usr/local/bin ou /opt, c'est le plus souvent un outil
+        # d'administration légitime — à lister, pas à qualifier de critique.
+        if in_tmp or hidden or path_is_hidden(entry_path):
+            score += 70
+            reasons.append('Bit SUID en zone monde-inscriptible ou cachée '
+                           '(propriétaire UID %d)' % st.st_uid)
+        else:
+            score += 30
+            reasons.append('Bit SUID hors des chemins système de la distribution '
+                           '(propriétaire UID %d) — à confronter à la baseline'
+                           % st.st_uid)
     if st.st_mode & stat.S_ISGID and executable:
         score += 35
         reasons.append('Bit SGID positionné (groupe GID %d)' % st.st_gid)
@@ -1232,7 +1337,8 @@ def score_file(entry_path, st, magic, root_tag, name):
         reasons.append('Fichier caché dans un répertoire temporaire')
 
     if entry_path.startswith('/dev/') and stat.S_ISREG(st.st_mode) \
-            and not entry_path.startswith(('/dev/shm/', '/dev/mqueue/')):
+            and not entry_path.startswith(('/dev/shm/', '/dev/mqueue/')) \
+            and not is_benign_device_node(entry_path):
         score += 45
         reasons.append('Fichier régulier sous /dev (hors tmpfs légitime)')
 
@@ -1299,7 +1405,8 @@ def scan_root(root, args, budget):
                 # FIFO, socket, device : jamais ouverts, mais un device inattendu
                 # dans /tmp mérite d'être signalé.
                 if (stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode)) \
-                        and not entry.path.startswith('/dev/'):
+                        and not entry.path.startswith('/dev/') \
+                        and not is_benign_device_node(entry.path):
                     findings.append({
                         'path': entry.path, 'st': st, 'score': 55,
                         'reasons': ['Fichier de périphérique hors de /dev'],
@@ -1309,6 +1416,11 @@ def scan_root(root, args, budget):
 
             seen_files += 1
             budget['left'] -= 1
+
+            # Le scanner ne se dénonce pas lui-même : sa table d'IoC déclenche
+            # ses propres règles de contenu.
+            if SELF_PATH and os.path.realpath(entry.path) == SELF_PATH:
+                continue
 
             # Pré-filtre bon marché avant toute lecture : on ne lit un fichier
             # que s'il est un candidat plausible.
@@ -1331,14 +1443,22 @@ def scan_root(root, args, budget):
             # souvent en clair et doit remonter en CRITIQUE, pas en MOYEN.
             if (file_kind(magic) == 'SCRIPT' or name.endswith(
                     ('.sh', '.py', '.pl', '.php', '.rb'))) \
-                    and in_tmp and st.st_size < 256 * 1024:
-                content = read_text(entry.path, limit=256 * 1024) or ''
+                    and in_tmp and st.st_size < CONTENT_SCAN_MAX:
+                content = read_text(entry.path, limit=CONTENT_SCAN_MAX) or ''
                 probe = content[:REGEX_PROBE_LIMIT].replace('"', '').replace("'", '')
-                for pattern, label, weight in CMD_PATTERNS:
-                    if pattern.search(probe):
-                        score += weight
-                        reasons.append('Contenu du script — %s' % label)
-                        break
+                matches = [(w, l) for pat, l, w in CMD_PATTERNS if pat.search(probe)]
+                # Un dropper est court et concentre 1 ou 2 techniques. Un fichier
+                # qui les cumule toutes est presque toujours une liste d'IoC, une
+                # cheat-sheet ou un outil de détection (celui-ci y compris) :
+                # le signaler serait un faux positif systématique.
+                if len(matches) >= IOC_LIST_THRESHOLD:
+                    reasons.append('Cumule %d techniques distinctes : signature '
+                                   'd\'une liste d\'IoC ou d\'un outil de sécurité, '
+                                   'non scoré' % len(matches))
+                elif matches:
+                    weight, label = max(matches)
+                    score += weight
+                    reasons.append('Contenu du script — %s' % label)
 
             if root['tag'] == 'persistance' and st.st_size < 256 * 1024:
                 content = (read_text(entry.path, limit=256 * 1024)
@@ -1358,9 +1478,14 @@ def scan_root(root, args, budget):
 
             digest = None
             if not args.no_hash:
-                digest, magic2 = sha256_path(entry.path, args.max_file_size)
-                if magic2 and not magic:
-                    magic = magic2
+                if budget['hash_left'] > 0:
+                    budget['hash_left'] -= 1
+                    digest, magic2 = sha256_path(entry.path, args.max_file_size)
+                    if magic2 and not magic:
+                        magic = magic2
+                else:
+                    budget['hash_skipped'] += 1
+                    digest = 'NON-CALCULE (plafond de hachage atteint)'
 
             findings.append({
                 'path': entry.path, 'st': st, 'score': score,
@@ -1390,13 +1515,33 @@ def module_filesystem(args, is_root):
     out(C.grey('    %d racine(s) inspectée(s) — profondeur max %d, budget %d fichiers'
                % (len(roots), DEFAULT_MAX_DEPTH, GLOBAL_FILE_BUDGET)))
 
-    budget = {'left': GLOBAL_FILE_BUDGET}
+    budget = {'left': GLOBAL_FILE_BUDGET,
+              'hash_left': 0 if args.no_hash else args.max_hash_files,
+              'hash_skipped': 0}
     all_findings = []
     for root in roots:
         all_findings.extend(scan_root(root, args, budget))
 
     all_findings.sort(key=lambda f: -f['score'])
-    for item in all_findings:
+    truncated = max(0, len(all_findings) - args.max_file_findings)
+    if truncated:
+        REPORT.add(SEV_MEDIUM, 'FICHIER',
+                   '[MOYEN] Restitution tronquée : %d artefact(s) supplémentaire(s) '
+                   'non détaillé(s)' % truncated,
+                   ['Les %d artefacts les mieux notés sont détaillés ci-dessus.'
+                    % args.max_file_findings,
+                    'Un volume aussi élevé traduit en général une arborescence '
+                    'bruyante (serveur de build, /tmp partagé) plutôt qu\'une '
+                    'compromission massive.',
+                    'Cibler avec --extra-dir, remonter --min-file-score, ou '
+                    'relever --max-file-findings pour tout voir.'])
+    if budget['hash_skipped']:
+        REPORT.add(SEV_MEDIUM, 'FICHIER',
+                   '[MOYEN] Plafond de hachage atteint : %d fichier(s) non '
+                   'empreinté(s)' % budget['hash_skipped'],
+                   ['Plafond courant : %d fichiers (--max-hash-files).'
+                    % args.max_hash_files])
+    for item in all_findings[:args.max_file_findings]:
         st = item['st']
         label, _painter = severity_label(item['score'])
         title = '[%s] %s — score %d' % (label, sanitize(item['path'], 200), item['score'])
@@ -1470,9 +1615,12 @@ def render(args, is_root, elapsed):
         out(C.yellow('=' * 78))
         out(C.grey('Inclut les artefacts retenus sous le seuil d\'affichage : '
                    'soumettre l\'ensemble aux sources CTI avant de conclure.'))
-        for digest, path, ctx in REPORT.iocs:
+        for digest, path, ctx in REPORT.iocs[:MAX_IOC_ROWS]:
             out('%s  %s' % (digest, sanitize(path, 150)))
             out(C.grey('%s  %s' % (' ' * 64, ctx)))
+        if len(REPORT.iocs) > MAX_IOC_ROWS:
+            out(C.grey('... %d empreinte(s) supplémentaire(s) non affichée(s).'
+                       % (len(REPORT.iocs) - MAX_IOC_ROWS)))
 
     out('')
     out(C.yellow('-' * 78))
@@ -1578,9 +1726,28 @@ def parse_args(argv):
                         help='seuil de rétention d\'un artefact fichier (défaut : 25)')
     parser.add_argument('--max-file-size', type=int, default=DEFAULT_MAX_HASH_SIZE,
                         help='taille maximale empreintée en octets (défaut : 128 Mo)')
+    parser.add_argument('--max-file-findings', type=int,
+                        default=DEFAULT_MAX_FILE_FINDINGS,
+                        help='artefacts fichiers détaillés dans le rapport '
+                             '(défaut : %d)' % DEFAULT_MAX_FILE_FINDINGS)
+    parser.add_argument('--max-hash-files', type=int,
+                        default=DEFAULT_MAX_HASH_FILES,
+                        help='plafond global de fichiers empreintés '
+                             '(défaut : %d)' % DEFAULT_MAX_HASH_FILES)
     parser.add_argument('--extra-dir', action='append', metavar='CHEMIN',
                         help='répertoire supplémentaire à inspecter (répétable)')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    # Bornage défensif : une valeur absurde ne doit pas produire un
+    # comportement silencieusement incohérent (empreintes toutes refusées,
+    # rapport vide sans explication...).
+    args.max_file_size = max(1, min(args.max_file_size, 64 * 1024 ** 3))
+    args.max_hash_files = max(0, min(args.max_hash_files, 1000000))
+    args.max_file_findings = max(1, min(args.max_file_findings, 100000))
+    args.min_score = max(0, min(args.min_score, 1000))
+    args.min_file_score = max(0, min(args.min_file_score, 1000))
+    args.extra_dir = [d for d in (args.extra_dir or []) if os.path.isabs(d)]
+    return args
 
 
 def main(argv=None):
