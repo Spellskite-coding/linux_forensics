@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-linux_forensics.py - DFIR LINUX SNIPER v2.2
+linux_forensics.py - DFIR LINUX SNIPER v2.3
 Corrélateur Réseau / Processus / Système de fichiers pour live forensics Linux.
 
 Contraintes de conception (inchangées) :
@@ -14,6 +14,38 @@ Contraintes de conception (inchangées) :
 
 Sortie : indicateurs pondérés + SHA256 de chaque artefact retenu, pour
 pivot CTI (VirusTotal / MISP / OpenCTI / MalwareBazaar).
+
+Changelog v2.3 — campagne faux négatifs
+---------------------------------------
+Banc de 12 techniques d'attaque non anticipées par les règles : 10 passaient
+au travers. Toutes détectées après correction.
+
+Détection ajoutée :
+  * Intégrité par la base de paquets : lecture directe de
+    /var/lib/dpkg/info/*.md5sums (aucun appel à dpkg, aucun binaire externe).
+    Un binaire de distribution modifié ou un implant déposé dans /usr/lib
+    qu'aucun paquet ne revendique sont désormais visibles. Appliqué par défaut
+    aux binaires en cours d'exécution et aux SUID ; --verify-system étend le
+    contrôle à tous les binaires système. Les diversions dpkg-divert sont
+    prises en compte (sinon /usr/bin/man remontait à tort).
+  * Persistance systemd (unités système, utilisateur et générateurs),
+    autostart XDG, environment.d, fichiers de démarrage shell (.bashrc,
+    .profile, .zshrc...), règles udev, ld.so.conf.d, jobs at, init.d,
+    apt.conf.d, sudoers.d.
+  * Balayage des binaires SUID/SGID des chemins système : un SUID dont le
+    contenu est un interpréteur (empreinte comparée aux shells de l'hôte) est
+    une porte dérobée d'élévation, quel que soit son nom.
+  * Zones de staging /var/lib, /var/cache, /usr/share.
+Correctifs :
+  * Un même fichier atteint par deux racines (/root et /root/.ssh) était
+    restitué deux fois : déduplication par chemin réel, meilleur score retenu.
+  * Contenu de persistance à trois niveaux au lieu de deux : la référence à
+    une zone monde-inscriptible ne pèse que 20 dans un fichier de
+    distribution, 45 ailleurs.
+  * ld.so.conf.d : comparaison sur chemin normalisé (libc.conf déclare
+    '/usr/local/lib' sans slash final et remontait à tort).
+  * Avertissement explicite si --verify-system est lancé sans root : des
+    milliers d'atimes seront modifiés faute d'O_NOATIME.
 
 Changelog v2.2
 --------------
@@ -94,7 +126,7 @@ import stat
 import sys
 import time
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 # ==========================================================================
 # CONFIGURATION & IoC
@@ -225,9 +257,25 @@ PERSISTENCE_FILES = (
     '/etc/hosts.deny', '/etc/sudoers',
 )
 PERSISTENCE_DIRS = (
+    # Tâches planifiées
     '/etc/cron.d', '/etc/cron.hourly', '/etc/cron.daily',
-    '/etc/cron.weekly', '/etc/cron.monthly', '/etc/profile.d',
-    '/etc/update-motd.d', '/var/spool/cron', '/var/spool/cron/crontabs',
+    '/etc/cron.weekly', '/etc/cron.monthly',
+    '/var/spool/cron', '/var/spool/cron/crontabs', '/var/spool/cron/atjobs',
+    '/var/spool/at',
+    # Démarrage et environnement shell
+    '/etc/profile.d', '/etc/update-motd.d', '/etc/init.d',
+    '/etc/rc.local.d',
+    # Unités systemd (système et générateurs)
+    '/etc/systemd/system', '/lib/systemd/system', '/usr/lib/systemd/system',
+    '/etc/systemd/user', '/usr/lib/systemd/user',
+    '/etc/systemd/system-generators', '/usr/lib/systemd/system-generators',
+    # Démarrage graphique
+    '/etc/xdg/autostart',
+    # Chargement de bibliothèques et périphériques
+    '/etc/ld.so.conf.d', '/etc/udev/rules.d', '/lib/udev/rules.d',
+    '/usr/lib/udev/rules.d',
+    # Chaîne de paquets (APT::Update::Pre-Invoke est un vecteur connu)
+    '/etc/apt/apt.conf.d', '/etc/sudoers.d',
 )
 # Deux niveaux : le niveau faible (curl/wget seuls) est omniprésent dans les
 # scripts légitimes de distribution (update-motd, apt, certbot...).
@@ -236,9 +284,33 @@ PERSISTENCE_STRONG = re.compile(
     r'base64\s+(-d|--decode)[^\n]{0,80}\|\s*(ba)?sh|'
     r'(curl|wget)[^\n]{0,120}\|\s*(ba)?sh|'
     r'\b(chattr\s+[+-]i|history\s+-c|HISTFILE=/dev/null)\b|'
-    r'(/tmp/|/dev/shm/|/var/tmp/)[\w.\-]*\s*(&|;|$)', re.I | re.M)
+    r'memfd_create|\bsocat\b[^\n]{0,80}exec:', re.I | re.M)
+# Référence à une zone monde-inscriptible : anormal dans une unité ou une
+# tâche déposée par un tiers, banal dans un script de distribution.
+PERSISTENCE_MEDIUM = re.compile(
+    r'(/tmp/|/dev/shm/|/var/tmp/|/run/shm/)[\w.\-]+', re.I)
 PERSISTENCE_WEAK = re.compile(
     r'\b(curl|wget)\b|\bbase64\b|\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b', re.I)
+
+# Fichiers de démarrage shell : vecteur de persistance utilisateur classique.
+SHELL_RC_NAMES = frozenset([
+    '.bashrc', '.bash_profile', '.bash_login', '.bash_logout', '.profile',
+    '.zshrc', '.zprofile', '.zshenv', '.zlogin', '.kshrc', '.cshrc',
+    '.login', '.xprofile', '.xinitrc', '.xsession', '.pam_environment',
+    'bash.bashrc', 'profile', 'zshrc', 'zprofile', 'zshenv',
+])
+
+# Interpréteurs : un binaire SUID dont le contenu est un shell est une porte
+# dérobée d'élévation, quel que soit son nom.
+INTERPRETER_PATHS = (
+    '/bin/bash', '/bin/sh', '/bin/dash', '/bin/zsh', '/bin/ksh', '/bin/busybox',
+    '/usr/bin/bash', '/usr/bin/sh', '/usr/bin/dash', '/usr/bin/zsh',
+    '/usr/bin/ksh', '/usr/bin/busybox', '/usr/bin/perl', '/usr/bin/env',
+)
+# Répertoires balayés à la recherche de binaires SUID/SGID anormaux.
+SETUID_SWEEP_DIRS = ('/usr/bin', '/usr/sbin', '/bin', '/sbin',
+                     '/usr/local/bin', '/usr/local/sbin', '/usr/lib',
+                     '/usr/libexec', '/opt')
 
 # --- Noeuds de périphérique légitimes hors /dev ---
 # systemd crée chr/blk/fifo/sock/dir/reg en mode 0000 dans
@@ -250,6 +322,135 @@ BENIGN_DEVICE_NODES = re.compile(
 
 def is_benign_device_node(path):
     return bool(BENIGN_DEVICE_NODES.search(path))
+
+
+# --- Répertoires appartenant à la distribution (vérifiables par paquet) ---
+DISTRO_DIRS = ('/usr/bin/', '/usr/sbin/', '/usr/lib/', '/usr/libexec/',
+               '/bin/', '/sbin/', '/lib/', '/lib64/', '/usr/lib64/')
+DPKG_INFO_DIR = '/var/lib/dpkg/info'
+MD5SUMS_READ_LIMIT = 16 * 1024 * 1024
+
+
+def _package_keys(path):
+    """Clés candidates dans la base dpkg, en tenant compte du usr-merge
+    (/bin/sleep est listé usr/bin/sleep sur les distributions fusionnées)."""
+    rel = path.lstrip('/')
+    keys = {rel}
+    for prefix in ('bin/', 'sbin/', 'lib/', 'lib64/'):
+        if rel.startswith(prefix):
+            keys.add('usr/' + rel)
+    if rel.startswith('usr/'):
+        keys.add(rel[4:])
+    return keys
+
+
+def dpkg_diversions():
+    """Chemins déroutés par dpkg-divert. Ils n'apparaissent pas dans les
+    md5sums du paquet d'origine et seraient sinon signalés 'hors-paquet'
+    (cas classique de /usr/bin/man dans les images conteneurisées)."""
+    data = read_text('/var/lib/dpkg/diversions', limit=4 * 1024 * 1024)
+    if not data:
+        return set()
+    lines = [l.strip() for l in data.splitlines() if l.strip()]
+    diverted = set()
+    # Format : 3 lignes par entrée (origine, destination, paquet).
+    for index in range(0, len(lines) - 2, 3):
+        diverted.add(lines[index])
+        diverted.add(lines[index + 1])
+    return diverted
+
+
+def package_baseline(paths):
+    """Empreintes MD5 de référence pour un ensemble borné de chemins.
+    Lecture directe de /var/lib/dpkg/info/*.md5sums : aucun appel à dpkg,
+    aucun binaire externe, et seules les entrées demandées sont conservées en
+    mémoire. Retourne None si l'hôte n'est pas basé sur dpkg."""
+    if not os.path.isdir(DPKG_INFO_DIR):
+        return None
+    wanted = {}
+    for path in paths:
+        for key in _package_keys(path):
+            wanted.setdefault(key, set()).add(path)
+    if not wanted:
+        return {}
+    found = {}
+    try:
+        with os.scandir(DPKG_INFO_DIR) as entries:
+            for entry in entries:
+                if not entry.name.endswith('.md5sums'):
+                    continue
+                data = read_text(entry.path, limit=MD5SUMS_READ_LIMIT)
+                if not data:
+                    continue
+                for line in data.splitlines():
+                    parts = line.split(None, 1)
+                    if len(parts) != 2:
+                        continue
+                    digest, rel = parts[0], parts[1].strip()
+                    for target in wanted.get(rel, ()):
+                        found[target] = digest
+    except OSError:
+        return None
+    return found
+
+
+def md5_path(path, max_size):
+    """MD5 d'un fichier régulier, uniquement pour comparer à la base dpkg qui
+    ne publie que des MD5. Jamais utilisé comme IoC."""
+    fd = open_ro(path, nofollow=False)
+    if fd is None:
+        return None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_size:
+            return None
+        h = hashlib.md5()
+        while True:
+            try:
+                chunk = os.read(fd, HASH_CHUNK)
+            except (BlockingIOError, InterruptedError, OSError):
+                return None
+            if not chunk:
+                break
+            h.update(chunk)
+        return h.hexdigest()
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def verify_against_packages(paths, max_size):
+    """{chemin: 'ok'|'modifie'|'hors-paquet'} pour les chemins situés dans une
+    arborescence de distribution. 'hors-paquet' signale un binaire qu'aucun
+    paquet ne revendique : un implant déposé dans /usr/lib en est un."""
+    targets = [p for p in paths if any(p.startswith(d) for d in DISTRO_DIRS)]
+    if not targets:
+        return {}
+    baseline = package_baseline(targets)
+    if baseline is None:
+        return {}
+    diverted = dpkg_diversions()
+    verdicts = {}
+    for path in targets:
+        reference = baseline.get(path)
+        if reference is None:
+            if path in diverted or any(path.endswith(suffix) for suffix in
+                                       ('.orig', '.dpkg-old', '.dpkg-new',
+                                        '.dpkg-dist', '.distrib', '.bak')):
+                verdicts[path] = 'ok'
+                continue
+            verdicts[path] = 'hors-paquet'
+            continue
+        actual = md5_path(path, max_size)
+        if actual is None:
+            continue
+        verdicts[path] = 'ok' if actual == reference else 'modifie'
+    return verdicts
 
 
 # --- Magies de fichiers ---
@@ -707,7 +908,8 @@ def path_is_hidden(path):
                for part in path.split('/') if part)
 
 
-LIB_TRUSTED_PREFIX = ('/usr/lib/', '/usr/lib64/', '/lib/', '/lib64/',
+LIB_TRUSTED_PREFIX = ('/usr/lib/', '/usr/lib64/', '/usr/lib32/', '/usr/libx32/',
+                      '/lib/', '/lib64/', '/libx32/', '/lib32/',
                       '/usr/local/lib/', '/usr/libexec/', '/opt/', '/snap/')
 MAPS_READ_LIMIT = 4 * 1024 * 1024
 
@@ -784,7 +986,7 @@ def exe_privilege_state(pid):
     return 'plain'
 
 
-def analyse_process(pid, sockets, init_netns, args, is_root):
+def analyse_process(pid, sockets, init_netns, args, is_root, pkg_verdicts=None):
     """Analyse un PID et retourne un dict de constat si le score est retenu."""
     proc_dir = '/proc/%s' % pid
     st = parse_proc_stat(pid)
@@ -843,6 +1045,17 @@ def analyse_process(pid, sockets, init_netns, args, is_root):
             score += 45
             reasons.append(('Exécution depuis un répertoire caché : %s'
                             % sanitize(exe_clean, 160), 45))
+
+    # --- Intégrité du binaire vis-à-vis de la base de paquets ---
+    verdict = (pkg_verdicts or {}).get(exe_clean)
+    if verdict == 'modifie':
+        score += 80
+        reasons.append(('Binaire de distribution MODIFIÉ : le contenu ne '
+                        'correspond pas à l\'empreinte du paquet', 80))
+    elif verdict == 'hors-paquet':
+        score += 45
+        reasons.append(('Binaire situé dans une arborescence de distribution '
+                        'mais revendiqué par aucun paquet installé', 45))
 
     # --- Usurpation d'identité de thread noyau ---
     comm = sanitize(st['comm'], 64)
@@ -1032,10 +1245,26 @@ def module_processes(args, is_root):
                % (len(pids), len(netns_map) or 1, len(sockets))))
 
     out(C.cyan('[*] Étape 2/4 — Corrélation PID <-> socket et scoring comportemental'))
+
+    # Vérification d'intégrité groupée : la base de paquets n'est parcourue
+    # qu'une fois pour l'ensemble des binaires en cours d'exécution.
+    exes = set()
+    for pid in pids:
+        link = readlink('/proc/%s/exe' % pid)
+        if link and not link.endswith(' (deleted)'):
+            exes.add(link)
+    pkg_verdicts = {} if args.no_pkgcheck else verify_against_packages(
+        sorted(exes), args.max_file_size)
+    if pkg_verdicts:
+        anomalies = sum(1 for v in pkg_verdicts.values() if v != 'ok')
+        out(C.grey('    %d binaire(s) confronté(s) à la base de paquets, '
+                   '%d écart(s)' % (len(pkg_verdicts), anomalies)))
+
     hits = []
     for pid in pids:
         try:
-            result = analyse_process(pid, sockets, init_netns, args, is_root)
+            result = analyse_process(pid, sockets, init_netns, args, is_root,
+                                     pkg_verdicts)
         except OSError:
             continue          # le processus a disparu pendant l'analyse
         if result:
@@ -1166,6 +1395,78 @@ def detect_partial_proc_view():
     if comm.strip() not in ('systemd', 'init', 'upstart', 'openrc-init', 'runit', ''):
         hints.append('PID 1 atypique (%s)' % sanitize(comm, 32))
     return hints
+
+
+def module_verify_system(args):
+    """Confrontation exhaustive des binaires système à la base de paquets.
+    Optionnelle : coûteuse en I/O, mais c'est le seul contrôle qui détecte un
+    binaire de distribution trojanisé qui n'est pas en cours d'exécution."""
+    out(C.cyan('[*] Étape complémentaire — Intégrité des binaires système'))
+    seen = set()
+    targets = []
+    for base in ('/usr/bin', '/usr/sbin', '/bin', '/sbin', '/usr/libexec'):
+        stack = [(base, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > 2:
+                continue
+            try:
+                entries = list(os.scandir(current))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    if entry.name not in SKIP_DIR_NAMES:
+                        stack.append((entry.path, depth + 1))
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                try:
+                    key = (st.st_dev, st.st_ino)
+                except AttributeError:
+                    key = entry.path
+                if key in seen:
+                    continue        # usr-merge : /bin/x et /usr/bin/x
+                seen.add(key)
+                targets.append((entry.path, st))
+
+    verdicts = verify_against_packages([p for p, _ in targets],
+                                       args.max_file_size)
+    if not verdicts:
+        out(C.grey('    Base de paquets indisponible (hôte non dpkg) : '
+                   'contrôle ignoré'))
+        return
+
+    anomalies = 0
+    for path, st in targets:
+        verdict = verdicts.get(path)
+        if verdict in (None, 'ok'):
+            continue
+        anomalies += 1
+        digest, magic = sha256_path(path, args.max_file_size)
+        score = 80 if verdict == 'modifie' else 40
+        reasons = ['Binaire de distribution MODIFIÉ (contenu différent de '
+                   'l\'empreinte du paquet)' if verdict == 'modifie' else
+                   'Fichier dans un chemin système revendiqué par aucun '
+                   'paquet installé']
+        details = [
+            'Type        : %s   Taille : %s   Mode : %s'
+            % (file_kind(magic), fmt_size(st.st_size), oct(st.st_mode & 0o7777)),
+            'Modifié le  : %s' % fmt_time(st.st_mtime),
+        ] + ['Motif       : %s' % r for r in reasons]
+        if digest:
+            details.append('SHA256      : %s' % digest)
+            REPORT.add_ioc(digest, path, 'binaire système %s' % verdict)
+        label, _painter = severity_label(score)
+        REPORT.add(score, 'INTEGRITE',
+                   '[%s] %s — score %d' % (label, sanitize(path, 200), score),
+                   details)
+    out(C.grey('    %d binaire(s) vérifié(s), %d écart(s)'
+               % (len(verdicts), anomalies)))
 
 
 def module_rootkit(pids, sockets, is_root):
@@ -1307,6 +1608,9 @@ def build_hunt_roots(is_root, extra_dirs):
         push(path, 2, 500, 'persistance')
     push('/var/www', 4, 4000, 'exposé web')
     push('/srv', 4, 4000, 'exposé service')
+    push('/var/lib', 4, 5000, 'staging système')
+    push('/var/cache', 3, 3000, 'staging système')
+    push('/usr/share', 3, 5000, 'staging système')
 
     # Répertoires utilisateurs
     homes = []
@@ -1330,9 +1634,15 @@ def build_hunt_roots(is_root, extra_dirs):
 
     for home in sorted(set(homes)):
         push(home, 1, 800, 'racine du home')
-        for sub in ('.config', '.local/share', '.local/bin', '.ssh', '.cache',
+        for sub in ('.local/share', '.local/bin', '.ssh', '.cache',
                     'bin', '.fonts', '.themes'):
             push(os.path.join(home, sub), 4, 3000, 'home caché')
+        # Persistance graphique et systemd côté utilisateur
+        for sub in ('.config/autostart', '.config/systemd/user',
+                    '.config/environment.d', '.local/share/systemd/user',
+                    '.config/upstart'):
+            push(os.path.join(home, sub), 3, 500, 'persistance')
+        push(os.path.join(home, '.config'), 4, 3000, 'home caché')
 
     # Sessions utilisateurs (tmpfs volatil, très prisé des implants)
     try:
@@ -1359,6 +1669,8 @@ def build_hunt_roots(is_root, extra_dirs):
 
 
 SKIP_DIR_NAMES = {
+    'docker', 'containerd', 'overlay2', 'snapd', 'flatpak', 'libvirt',
+    'apt', 'dpkg', 'rpm', 'man-db', 'locales', 'fontconfig', 'doc', 'icons',
     'node_modules', '.git', '.svn', '__pycache__', 'site-packages',
     'dist-packages', '.cargo', '.rustup', '.nvm', '.npm', '.m2', '.gradle',
     'mozilla', 'chromium', 'google-chrome', 'BraveSoftware', 'thunderbird',
@@ -1532,7 +1844,9 @@ def scan_root(root, args, budget):
                          ('/tmp/', '/var/tmp/', '/dev/shm/', '/run/shm/',
                           '/dev/mqueue/', '/dev/'))
             special = bool(st.st_mode & (stat.S_ISUID | stat.S_ISGID))
-            persistence = root['tag'] == 'persistance' or name == 'authorized_keys'
+            persistence = (root['tag'] == 'persistance'
+                           or name in SHELL_RC_NAMES
+                           or name == 'authorized_keys')
             if not (hidden or executable or in_tmp or special or persistence):
                 continue
             if st.st_size == 0 and not special:
@@ -1562,18 +1876,48 @@ def scan_root(root, args, budget):
                     score += weight
                     reasons.append('Contenu du script — %s' % label)
 
-            if root['tag'] == 'persistance' and st.st_size < 256 * 1024:
-                content = (read_text(entry.path, limit=256 * 1024)
+            if persistence and st.st_size < CONTENT_SCAN_MAX:
+                content = (read_text(entry.path, limit=CONTENT_SCAN_MAX)
                            or '')[:REGEX_PROBE_LIMIT]
-                distro_owned = (st.st_uid == 0 and not (st.st_mode & stat.S_IWOTH))
+                # Un fichier appartenant à root et non inscriptible par un
+                # tiers vient presque toujours de la distribution : les
+                # signaux faibles y sont du bruit, les signaux forts non.
+                distro_owned = (st.st_uid == 0
+                                and not st.st_mode & stat.S_IWOTH
+                                and not entry.path.startswith(('/home/', '/root/')))
+                label = ('Fichier de démarrage shell'
+                         if name in SHELL_RC_NAMES else 'Point de persistance')
+
+                # /etc/ld.so.conf.d ne doit contenir que des répertoires de
+                # bibliothèques système : un chemin ailleurs redirige l'éditeur
+                # de liens de TOUS les binaires de l'hôte.
+                if '/ld.so.conf' in entry.path:
+                    for raw in content.splitlines():
+                        candidate = raw.split('#', 1)[0].strip()
+                        # Comparaison sur le chemin normalisé : libc.conf
+                        # déclare '/usr/local/lib' sans slash final.
+                        normalized = candidate.rstrip('/') + '/'
+                        if (candidate.startswith('/')
+                                and not normalized.startswith(LIB_TRUSTED_PREFIX)):
+                            score += 65
+                            reasons.append('Chemin de bibliothèque hors '
+                                           'arborescence système déclaré à '
+                                           'l\'éditeur de liens : %s'
+                                           % sanitize(candidate, 100))
+                            break
                 if PERSISTENCE_STRONG.search(content):
-                    score += 55
-                    reasons.append('Contenu de persistance à haut risque '
-                                   '(shell distant, décodage exécuté ou zone temporaire)')
+                    score += 60
+                    reasons.append('%s — shell distant, décodage exécuté ou '
+                                   'anti-forensic dans le contenu' % label)
+                elif PERSISTENCE_MEDIUM.search(content):
+                    weight = 20 if distro_owned else 45
+                    score += weight
+                    reasons.append('%s — référence à une zone monde-inscriptible'
+                                   % label)
                 elif PERSISTENCE_WEAK.search(content) and not distro_owned:
                     score += 30
-                    reasons.append('Tâche planifiée non maîtrisée appelant '
-                                   'réseau/décodage (propriétaire UID %d)' % st.st_uid)
+                    reasons.append('%s non maîtrisé appelant réseau/décodage '
+                                   '(propriétaire UID %d)' % (label, st.st_uid))
 
             if score < args.min_file_score:
                 continue
@@ -1593,6 +1937,84 @@ def scan_root(root, args, budget):
                 'path': entry.path, 'st': st, 'score': score,
                 'reasons': reasons, 'digest': digest, 'kind': file_kind(magic),
             })
+    return findings
+
+
+def interpreter_hashes(max_size):
+    """Empreintes des interpréteurs présents sur l'hôte."""
+    known = {}
+    for path in INTERPRETER_PATHS:
+        digest, _magic = sha256_path(path, max_size, nofollow=False)
+        if digest and len(digest) == 64:
+            known[digest] = path
+    return known
+
+
+def sweep_setuid_binaries(args):
+    """Recherche ciblée des binaires SUID/SGID dans les chemins système, puis
+    confrontation à la base de paquets et aux empreintes d'interpréteurs.
+    Les SUID légitimes (sudo, mount, passwd...) sont revendiqués par un paquet
+    et ne produisent aucun constat."""
+    candidates = []
+    for base in SETUID_SWEEP_DIRS:
+        stack = [(base, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > 2:
+                continue
+            try:
+                entries = list(os.scandir(current))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    if entry.name not in SKIP_DIR_NAMES:
+                        stack.append((entry.path, depth + 1))
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                    candidates.append((entry.path, st))
+
+    if not candidates:
+        return []
+
+    verdicts = ({} if args.no_pkgcheck
+                else verify_against_packages([p for p, _ in candidates],
+                                             args.max_file_size))
+    shells = interpreter_hashes(args.max_file_size)
+    findings = []
+    for path, st in candidates:
+        score = 0
+        reasons = []
+        digest, magic = sha256_path(path, args.max_file_size)
+
+        if digest and digest in shells:
+            score += 90
+            reasons.append('Binaire SUID/SGID dont le contenu est un '
+                           'interpréteur (%s) : porte dérobée d\'élévation'
+                           % shells[digest])
+        verdict = verdicts.get(path)
+        if verdict == 'modifie':
+            score += 80
+            reasons.append('Binaire SUID/SGID de distribution MODIFIÉ')
+        elif verdict == 'hors-paquet':
+            score += 50
+            reasons.append('Binaire SUID/SGID dans un chemin système mais '
+                           'revendiqué par aucun paquet installé')
+        if st.st_mode & stat.S_IWOTH:
+            score += 60
+            reasons.append('Binaire SUID/SGID inscriptible par tous')
+
+        if score < args.min_file_score:
+            continue
+        findings.append({'path': path, 'st': st, 'score': score,
+                         'reasons': reasons, 'digest': digest,
+                         'kind': file_kind(magic)})
     return findings
 
 
@@ -1620,9 +2042,23 @@ def module_filesystem(args, is_root):
     budget = {'left': GLOBAL_FILE_BUDGET,
               'hash_left': 0 if args.no_hash else args.max_hash_files,
               'hash_skipped': 0}
-    all_findings = []
+    raw_findings = []
     for root in roots:
-        all_findings.extend(scan_root(root, args, budget))
+        raw_findings.extend(scan_root(root, args, budget))
+    raw_findings.extend(sweep_setuid_binaries(args))
+
+    # Deux racines peuvent couvrir le même fichier (/root et /root/.ssh) :
+    # un artefact ne doit apparaître qu'une fois, avec son meilleur score.
+    unique = {}
+    for item in raw_findings:
+        try:
+            key = os.path.realpath(item['path'])
+        except OSError:
+            key = item['path']
+        previous = unique.get(key)
+        if previous is None or item['score'] > previous['score']:
+            unique[key] = item
+    all_findings = list(unique.values())
 
     all_findings.sort(key=lambda f: -f['score'])
     truncated = max(0, len(all_findings) - args.max_file_findings)
@@ -1696,7 +2132,8 @@ def render(args, is_root, elapsed):
         by_cat = {}
         for finding in findings:
             by_cat.setdefault(finding['category'], []).append(finding)
-        for category in ('ROOTKIT', 'PROCESSUS', 'FICHIER', 'PERSISTANCE'):
+        for category in ('ROOTKIT', 'PROCESSUS', 'INTEGRITE', 'FICHIER',
+                         'PERSISTANCE'):
             items = by_cat.get(category)
             if not items:
                 continue
@@ -1769,6 +2206,14 @@ def banner(is_root, args):
         'utilisateurs) : traiter le transcript comme une pièce à conviction.')
     out('  6. Ordre d\'acquisition : capturer la RAM et le réseau AVANT ce scan si '
         'la volatilité prime.')
+    if args.verify_system and not is_root:
+        out('')
+        out(C.red('  ATTENTION : --verify-system en utilisateur standard lit '
+                  'des milliers de binaires système'))
+        out(C.red('  dont vous n\'êtes pas propriétaire : O_NOATIME est refusé '
+                  'et leur atime sera modifié.'))
+        out(C.red('  Préférer une exécution root, ou renoncer à ce contrôle si '
+                  'les atimes sont une preuve.'))
     out('')
 
 
@@ -1836,6 +2281,13 @@ def parse_args(argv):
                         default=DEFAULT_MAX_HASH_FILES,
                         help='plafond global de fichiers empreintés '
                              '(défaut : %d)' % DEFAULT_MAX_HASH_FILES)
+    parser.add_argument('--verify-system', action='store_true',
+                        help='confronte TOUS les binaires système à la base de '
+                             'paquets (détecte un binaire trojanisé non lancé ; '
+                             'quelques secondes d\'I/O supplémentaires)')
+    parser.add_argument('--no-pkgcheck', action='store_true',
+                        help='ignore la confrontation à la base de paquets '
+                             '(dpkg)')
     parser.add_argument('--extra-dir', action='append', metavar='CHEMIN',
                         help='répertoire supplémentaire à inspecter (répétable)')
     args = parser.parse_args(argv)
@@ -1887,6 +2339,8 @@ def main(argv=None):
             module_rootkit(pids, sockets, is_root)
         else:
             out(C.grey('[*] Étape 3/4 ignorée (--no-rootkit)'))
+        if args.verify_system and not args.no_pkgcheck:
+            module_verify_system(args)
         if not args.no_fs:
             module_filesystem(args, is_root)
         else:
