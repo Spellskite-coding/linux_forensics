@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-linux_forensics.py - DFIR LINUX SNIPER v2.1
+linux_forensics.py - DFIR LINUX SNIPER v2.2
 Corrélateur Réseau / Processus / Système de fichiers pour live forensics Linux.
 
 Contraintes de conception (inchangées) :
@@ -14,6 +14,23 @@ Contraintes de conception (inchangées) :
 
 Sortie : indicateurs pondérés + SHA256 de chaque artefact retenu, pour
 pivot CTI (VirusTotal / MISP / OpenCTI / MalwareBazaar).
+
+Changelog v2.2
+--------------
+Faux positifs corrigés (Firefox ESR / session XFCE) :
+  * Les 9 processus de contenu Firefox remontaient pour
+    LD_PRELOAD=libmozsandbox.so, sa propre sandbox. L'allowlist par nom de
+    bibliothèque, non tenable, est remplacée par une évaluation de la
+    bibliothèque RÉELLEMENT chargée : le soname relatif est résolu via
+    /proc/<pid>/maps (sans exécuter ldconfig), puis jugé sur sa provenance,
+    son propriétaire et ses permissions. /usr/lib appartenant à root et non
+    inscriptible par d'autres = intégration légitime, silence total.
+  * Un chemin absolu en zone temporaire, home ou chemin caché reste
+    critique même si le fichier a disparu (implant effaçant son .so).
+  * Fichiers de session X11/XFCE/PulseAudio (.X0-lock, .xfsm-ICE-*,
+    .ICEauthority, .pulse-*) écartés de la collecte quand ils sont inertes :
+    données pures, non exécutables, < 64 Ko. Un ELF ou un script portant
+    l'un de ces noms reste signalé (mimétisme).
 
 Changelog v2.1
 --------------
@@ -77,7 +94,7 @@ import stat
 import sys
 import time
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 # ==========================================================================
 # CONFIGURATION & IoC
@@ -154,13 +171,6 @@ CMD_PATTERNS = [
 # --- Variables d'environnement à haut risque ---
 ENV_CRITICAL = ('LD_PRELOAD', 'LD_AUDIT')
 ENV_WATCH = ('LD_LIBRARY_PATH', 'PROMPT_COMMAND', 'BASH_ENV', 'ENV', 'PYTHONSTARTUP')
-
-# Chemins tolérés pour LD_PRELOAD/LD_AUDIT (intégrations légitimes connues)
-ENV_ALLOW_SUBSTR = (
-    'libsnapd-glib', '/snap/', 'nvidia', 'libgtk3-nocsd', 'libfakeroot',
-    'libjemalloc', 'libtcmalloc', 'libnss_', 'libpam', '/usr/lib/apt/',
-    'libSegFault', 'libjvm', 'libasan', 'libtsan', 'libeatmydata',
-)
 
 # --- Répertoires d'exécution atypiques ---
 EXEC_RED_ZONES = (
@@ -697,6 +707,68 @@ def path_is_hidden(path):
                for part in path.split('/') if part)
 
 
+LIB_TRUSTED_PREFIX = ('/usr/lib/', '/usr/lib64/', '/lib/', '/lib64/',
+                      '/usr/local/lib/', '/usr/libexec/', '/opt/', '/snap/')
+MAPS_READ_LIMIT = 4 * 1024 * 1024
+
+
+def resolve_preloaded_lib(pid, token):
+    """Chemin réellement chargé pour une entrée LD_PRELOAD. Une valeur
+    relative (Firefox exporte 'libmozsandbox.so') est résolue en lisant les
+    mappings du processus, sans exécuter ldconfig ni le moindre binaire."""
+    token = token.strip()
+    if not token:
+        return None
+    if os.path.isabs(token):
+        return token
+    base = os.path.basename(token)
+    maps = read_text('/proc/%s/maps' % pid, limit=MAPS_READ_LIMIT)
+    if not maps:
+        return None
+    for line in maps.splitlines():
+        idx = line.find(' /')
+        if idx == -1:
+            continue
+        path = line[idx + 1:].strip()
+        if path and os.path.basename(path) == base:
+            return path
+    return None
+
+
+def risky_lib_path(path):
+    """Chemin de bibliothèque intrinsèquement anormal, même si le fichier
+    n'existe plus : un implant efface souvent son .so après chargement."""
+    if not path or not os.path.isabs(path):
+        return False
+    return (any(path.startswith(z) for z in EXEC_RED_ZONES)
+            or path.startswith(('/home/', '/root/', '/var/www/', '/srv/'))
+            or path_is_hidden(path))
+
+
+def classify_preloaded_lib(pid, token):
+    """'system' (intégration légitime), 'suspect' ou 'unknown'."""
+    resolved = resolve_preloaded_lib(pid, token)
+    if not resolved:
+        return ('suspect' if risky_lib_path(token) else 'unknown'), None
+    try:
+        real = os.path.realpath(resolved)
+        st = os.stat(real)
+    except OSError:
+        # Fichier disparu : le chemin déclaré reste jugeable.
+        return ('suspect' if risky_lib_path(resolved) else 'unknown'), None
+    if not stat.S_ISREG(st.st_mode):
+        return 'suspect', real
+    # Inscriptible par le monde, ou par un groupe autre que root : toute
+    # personne pouvant réécrire la bibliothèque peut injecter du code.
+    writable_by_others = bool(st.st_mode & stat.S_IWOTH) or (
+        bool(st.st_mode & stat.S_IWGRP) and st.st_gid != 0)
+    trusted = (any(real.startswith(pfx) for pfx in LIB_TRUSTED_PREFIX)
+               and st.st_uid == 0
+               and not writable_by_others
+               and not path_is_hidden(real))
+    return ('system' if trusted else 'suspect'), real
+
+
 def exe_privilege_state(pid):
     """'setuid-root' / 'setgid' / 'plain' / 'unknown' pour le binaire mappé.
     Passe par /proc/<pid>/exe : donne l'inode réel même si le fichier a été
@@ -851,19 +923,35 @@ def analyse_process(pid, sockets, init_netns, args, is_root):
                 continue
             if name in ENV_CRITICAL and value.strip():
                 seen_env.add(name)
-                if any(sub in value for sub in ENV_ALLOW_SUBSTR):
-                    continue
-                risky = any(value.startswith(z) or z in value for z in EXEC_RED_ZONES) \
-                    or path_is_hidden(value) or '/home/' in value
-                weight = 70 if risky else 40
-                score += weight
-                reasons.append(('Injection de bibliothèque via %s=%s'
-                                % (name, sanitize(value, 160)), weight))
-                for lib in re.split(r'[:\s]+', value):
-                    if lib and os.path.isabs(lib):
-                        digest, _magic = sha256_path(lib, args.max_file_size)
+                # On ne juge pas la variable sur son libellé mais sur la
+                # bibliothèque effectivement chargée : provenance, propriétaire
+                # et permissions. Firefox (libmozsandbox.so), snapd, NVIDIA ou
+                # jemalloc préchargent légitimement depuis /usr/lib.
+                for token in re.split(r'[:\s]+', value):
+                    if not token.strip():
+                        continue
+                    verdict, resolved = classify_preloaded_lib(pid, token)
+                    if verdict == 'system':
+                        continue
+                    if verdict == 'suspect':
+                        weight = 70
+                        detail = ('Injection de bibliothèque via %s : %s '
+                                  '(hors chemin système, ou propriétaire / '
+                                  'permissions anormaux)'
+                                  % (name, sanitize(resolved or token, 160)))
+                    else:
+                        weight = 25
+                        detail = ('%s=%s défini mais la bibliothèque n\'est pas '
+                                  'mappée dans le processus (préchargement '
+                                  'échoué ou effacé)'
+                                  % (name, sanitize(token, 120)))
+                    score += weight
+                    reasons.append((detail, weight))
+                    if resolved:
+                        digest, _magic = sha256_path(resolved, args.max_file_size)
                         if digest:
-                            hashes.append((digest, lib, 'bibliothèque préchargée'))
+                            hashes.append((digest, resolved,
+                                           'bibliothèque préchargée'))
             elif name in ENV_WATCH and value.strip():
                 probe = value.replace('"', '').replace("'", '')
                 for pattern, label, weight in CMD_PATTERNS:
@@ -1283,12 +1371,26 @@ except (NameError, OSError):
     SELF_PATH = ''
 
 
+# Artefacts de session X11/XFCE/PulseAudio, créés à chaque ouverture de
+# session dans /tmp. Écartés uniquement s'ils sont inertes : données pures,
+# non exécutables et de petite taille. Un fichier ELF ou un script portant
+# l'un de ces noms reste signalé (technique de mimétisme connue).
+BENIGN_SESSION_FILES = re.compile(
+    r'^\.(X\d+-lock|ICEauthority|Xauthority|xfsm-ICE-[A-Za-z0-9]{4,10}|'
+    r'esd-\d+|pulse-[A-Za-z0-9]+|wl-[A-Za-z0-9-]+|xdg-[A-Za-z0-9-]+)$')
+BENIGN_SESSION_MAX = 64 * 1024
+
+
 def score_file(entry_path, st, magic, root_tag, name):
     """Pondération d'un artefact fichier. Retourne (score, [motifs])."""
     score = 0
     reasons = []
     hidden = name.startswith('.')
     kind = file_kind(magic)
+
+    if (BENIGN_SESSION_FILES.match(name) and kind == 'DATA'
+            and not st.st_mode & 0o111 and st.st_size < BENIGN_SESSION_MAX):
+        return 0, []
     executable = bool(st.st_mode & 0o111)
     in_tmp = any(entry_path.startswith(z) for z in
                  ('/tmp/', '/var/tmp/', '/dev/shm/', '/run/shm/', '/dev/mqueue/'))
