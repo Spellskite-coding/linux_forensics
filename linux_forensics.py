@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-linux_forensics.py - DFIR LINUX SNIPER v2.3
+linux_forensics.py - DFIR LINUX SNIPER v2.4
 Corrélateur Réseau / Processus / Système de fichiers pour live forensics Linux.
 
 Contraintes de conception (inchangées) :
@@ -14,6 +14,42 @@ Contraintes de conception (inchangées) :
 
 Sortie : indicateurs pondérés + SHA256 de chaque artefact retenu, pour
 pivot CTI (VirusTotal / MISP / OpenCTI / MalwareBazaar).
+
+Changelog v2.4 — campagne de tests en conteneurs (Debian, Ubuntu, RockyLinux,
+AlmaLinux) avec simulation d'attaque et SAST (bandit, semgrep, pyflakes)
+------------------------------------------------------------------------
+Détection ajoutée :
+  * Confrontation légère et non récursive de /usr/bin, /usr/sbin, /bin,
+    /sbin à la base de paquets, exécutée PAR DÉFAUT (auparavant réservée à
+    --verify-system, qui reste seul à parcourir récursivement /usr/lib et
+    /usr/libexec). Fermait un angle mort réel : un implant déposé
+    directement dans /usr/bin, sans bit SUID et sans être en cours
+    d'exécution durant le scan, était invisible sans penser explicitement à
+    --verify-system. Le verdict 'MODIFIÉ' (empreinte divergente, rare et
+    univoque) reste pondéré comme avant ; le verdict 'hors-paquet' (fréquent
+    et souvent légitime sur une image Docker officielle — policy-rc.d,
+    pebble, initctl ajoutés par l'outillage de construction, jamais par un
+    paquet) est pondéré plus bas par défaut pour rester silencieux au seuil
+    d'affichage standard tout en restant présent dans la table de pivot
+    CTI ; --verify-system, explicitement demandé, garde le poids plein.
+Correctifs :
+  * Le dédoublonnage par chemin réel des artefacts fichiers ne conservait
+    que le motif du finding au score le plus haut et jetait silencieusement
+    les autres : un binaire SUID copie d'un interpréteur (porte dérobée
+    d'élévation, motif le plus décisif du rapport) pouvait disparaître du
+    constat si une heuristique généraliste sans rapport (nom caché, zone
+    inscriptible) affichait par ailleurs un score plus élevé sur le même
+    fichier. Fusion par texte de motif (évite le double comptage d'un motif
+    identique détecté deux fois via des racines de parcours qui se
+    recouvrent) au lieu d'un remplacement par le seul meilleur score.
+  * --no-hash n'était pas honoré par le balayage SUID/SGID : une empreinte
+    SHA256 était systématiquement calculée pour chaque binaire SUID/SGID
+    trouvé, contredisant la promesse documentée (« n'empreinte aucun
+    fichier ») et coûtant du CPU/IO sur un hôte de production justement
+    sollicité en mode triage rapide.
+  * Empreinte MD5 (comparaison à la base dpkg uniquement, jamais un IoC)
+    marquée usedforsecurity=False pour les scanners SAST, avec repli
+    silencieux pour Python < 3.9.
 
 Changelog v2.3 — campagne faux négatifs
 ---------------------------------------
@@ -126,7 +162,7 @@ import stat
 import sys
 import time
 
-VERSION = "2.3"
+VERSION = "2.4"
 
 # ==========================================================================
 # CONFIGURATION & IoC
@@ -311,6 +347,14 @@ INTERPRETER_PATHS = (
 SETUID_SWEEP_DIRS = ('/usr/bin', '/usr/sbin', '/bin', '/sbin',
                      '/usr/local/bin', '/usr/local/sbin', '/usr/lib',
                      '/usr/libexec', '/opt')
+# Répertoires binaires système principaux, confrontés à la base de paquets à
+# CHAQUE exécution (non récursif : seul le niveau 0, quelques centaines à
+# quelques milliers de fichiers). Sans ce contrôle par défaut, un implant
+# déposé directement dans /usr/bin — sans bit SUID et jamais exécuté durant
+# le scan — resterait invisible tant que l'analyste ne pense pas à relancer
+# avec --verify-system, qui seul parcourt récursivement l'arborescence
+# complète (/usr/lib, /usr/libexec, 2 niveaux de profondeur).
+PRIMARY_SYSTEM_BIN_DIRS = ('/usr/bin', '/usr/sbin', '/bin', '/sbin')
 
 # --- Noeuds de périphérique légitimes hors /dev ---
 # systemd crée chr/blk/fifo/sock/dir/reg en mode 0000 dans
@@ -394,6 +438,17 @@ def package_baseline(paths):
     return found
 
 
+def _new_md5():
+    """MD5 non cryptographique : seul algorithme publié par les .md5sums
+    dpkg, utilisé exclusivement pour comparer un binaire à cette base — pas
+    comme SHA256 IoC. usedforsecurity=False (Python >= 3.9) documente
+    l'intention pour les scanners SAST ; repli silencieux avant 3.9."""
+    try:
+        return hashlib.md5(usedforsecurity=False)
+    except TypeError:
+        return hashlib.md5()  # nosec B324 nosemgrep: py36-3.8 fallback, not a security use
+
+
 def md5_path(path, max_size):
     """MD5 d'un fichier régulier, uniquement pour comparer à la base dpkg qui
     ne publie que des MD5. Jamais utilisé comme IoC."""
@@ -407,7 +462,7 @@ def md5_path(path, max_size):
             return None
         if not stat.S_ISREG(st.st_mode) or st.st_size > max_size:
             return None
-        h = hashlib.md5()
+        h = _new_md5()
         while True:
             try:
                 chunk = os.read(fd, HASH_CHUNK)
@@ -1694,7 +1749,10 @@ BENIGN_SESSION_MAX = 64 * 1024
 
 
 def score_file(entry_path, st, magic, root_tag, name):
-    """Pondération d'un artefact fichier. Retourne (score, [motifs])."""
+    """Pondération d'un artefact fichier. Retourne (score, [(motif, poids)]) —
+    chaque motif porte son poids individuel pour permettre une fusion sans
+    double comptage lorsque plusieurs détections convergent sur un même
+    chemin réel (cf. dédoublonnage dans module_filesystem)."""
     score = 0
     reasons = []
     hidden = name.startswith('.')
@@ -1713,61 +1771,61 @@ def score_file(entry_path, st, magic, root_tag, name):
         # d'administration légitime — à lister, pas à qualifier de critique.
         if in_tmp or hidden or path_is_hidden(entry_path):
             score += 70
-            reasons.append('Bit SUID en zone monde-inscriptible ou cachée '
-                           '(propriétaire UID %d)' % st.st_uid)
+            reasons.append(('Bit SUID en zone monde-inscriptible ou cachée '
+                            '(propriétaire UID %d)' % st.st_uid, 70))
         else:
             score += 30
-            reasons.append('Bit SUID hors des chemins système de la distribution '
-                           '(propriétaire UID %d) — à confronter à la baseline'
-                           % st.st_uid)
+            reasons.append(('Bit SUID hors des chemins système de la distribution '
+                            '(propriétaire UID %d) — à confronter à la baseline'
+                            % st.st_uid, 30))
     if st.st_mode & stat.S_ISGID and executable:
         score += 35
-        reasons.append('Bit SGID positionné (groupe GID %d)' % st.st_gid)
+        reasons.append(('Bit SGID positionné (groupe GID %d)' % st.st_gid, 35))
 
     if kind == 'ELF':
         if in_tmp:
             score += 60
-            reasons.append('Binaire ELF dans un répertoire temporaire')
+            reasons.append(('Binaire ELF dans un répertoire temporaire', 60))
         elif hidden:
             score += 55
-            reasons.append('Binaire ELF portant un nom caché')
+            reasons.append(('Binaire ELF portant un nom caché', 55))
         elif entry_path.startswith('/dev/'):
             score += 70
-            reasons.append('Binaire ELF stocké sous /dev')
+            reasons.append(('Binaire ELF stocké sous /dev', 70))
         elif root_tag in ('exposé web', 'exposé service'):
             score += 45
-            reasons.append('Binaire ELF dans une arborescence exposée')
+            reasons.append(('Binaire ELF dans une arborescence exposée', 45))
         else:
             score += 20
-            reasons.append('Binaire ELF hors chemin système standard')
+            reasons.append(('Binaire ELF hors chemin système standard', 20))
     elif kind == 'SCRIPT' and (in_tmp or hidden) and executable:
         score += 35
-        reasons.append('Script exécutable %s' % ('caché' if hidden else 'temporaire'))
+        reasons.append(('Script exécutable %s' % ('caché' if hidden else 'temporaire'), 35))
     elif executable and in_tmp:
         score += 30
-        reasons.append('Fichier exécutable dans un répertoire temporaire')
+        reasons.append(('Fichier exécutable dans un répertoire temporaire', 30))
     elif hidden and in_tmp:
         score += 25
-        reasons.append('Fichier caché dans un répertoire temporaire')
+        reasons.append(('Fichier caché dans un répertoire temporaire', 25))
 
     if entry_path.startswith('/dev/') and stat.S_ISREG(st.st_mode) \
             and not entry_path.startswith(('/dev/shm/', '/dev/mqueue/')) \
             and not is_benign_device_node(entry_path):
         score += 45
-        reasons.append('Fichier régulier sous /dev (hors tmpfs légitime)')
+        reasons.append(('Fichier régulier sous /dev (hors tmpfs légitime)', 45))
 
     # Noms de dissimulation classiques
     if re.match(r'^\.{2,}$|^\s|\s$|^\.\s', name) or '\u200b' in name or '\u202e' in name:
         score += 40
-        reasons.append('Nom de fichier conçu pour la dissimulation visuelle')
+        reasons.append(('Nom de fichier conçu pour la dissimulation visuelle', 40))
     if re.match(r'^\.(X11|ICE|font|Test|cache)-?(unix|lock)?$', name) and stat.S_ISREG(st.st_mode):
         score += 30
-        reasons.append('Nom mimant un socket système classique')
+        reasons.append(('Nom mimant un socket système classique', 30))
 
     # Clés SSH et cron : persistance
     if name == 'authorized_keys':
         score += 30
-        reasons.append('Point de persistance SSH — vérifier chaque clé')
+        reasons.append(('Point de persistance SSH — vérifier chaque clé', 30))
 
     return score, reasons
 
@@ -1868,13 +1926,13 @@ def scan_root(root, args, budget):
                 # cheat-sheet ou un outil de détection (celui-ci y compris) :
                 # le signaler serait un faux positif systématique.
                 if len(matches) >= IOC_LIST_THRESHOLD:
-                    reasons.append('Cumule %d techniques distinctes : signature '
-                                   'd\'une liste d\'IoC ou d\'un outil de sécurité, '
-                                   'non scoré' % len(matches))
+                    reasons.append(('Cumule %d techniques distinctes : signature '
+                                    'd\'une liste d\'IoC ou d\'un outil de sécurité, '
+                                    'non scoré' % len(matches), 0))
                 elif matches:
                     weight, label = max(matches)
                     score += weight
-                    reasons.append('Contenu du script — %s' % label)
+                    reasons.append(('Contenu du script — %s' % label, weight))
 
             if persistence and st.st_size < CONTENT_SCAN_MAX:
                 content = (read_text(entry.path, limit=CONTENT_SCAN_MAX)
@@ -1900,24 +1958,24 @@ def scan_root(root, args, budget):
                         if (candidate.startswith('/')
                                 and not normalized.startswith(LIB_TRUSTED_PREFIX)):
                             score += 65
-                            reasons.append('Chemin de bibliothèque hors '
-                                           'arborescence système déclaré à '
-                                           'l\'éditeur de liens : %s'
-                                           % sanitize(candidate, 100))
+                            reasons.append(('Chemin de bibliothèque hors '
+                                            'arborescence système déclaré à '
+                                            'l\'éditeur de liens : %s'
+                                            % sanitize(candidate, 100), 65))
                             break
                 if PERSISTENCE_STRONG.search(content):
                     score += 60
-                    reasons.append('%s — shell distant, décodage exécuté ou '
-                                   'anti-forensic dans le contenu' % label)
+                    reasons.append(('%s — shell distant, décodage exécuté ou '
+                                    'anti-forensic dans le contenu' % label, 60))
                 elif PERSISTENCE_MEDIUM.search(content):
                     weight = 20 if distro_owned else 45
                     score += weight
-                    reasons.append('%s — référence à une zone monde-inscriptible'
-                                   % label)
+                    reasons.append(('%s — référence à une zone monde-inscriptible'
+                                    % label, weight))
                 elif PERSISTENCE_WEAK.search(content) and not distro_owned:
                     score += 30
-                    reasons.append('%s non maîtrisé appelant réseau/décodage '
-                                   '(propriétaire UID %d)' % (label, st.st_uid))
+                    reasons.append(('%s non maîtrisé appelant réseau/décodage '
+                                    '(propriétaire UID %d)' % (label, st.st_uid), 30))
 
             if score < args.min_file_score:
                 continue
@@ -1983,37 +2041,119 @@ def sweep_setuid_binaries(args):
     if not candidates:
         return []
 
-    verdicts = ({} if args.no_pkgcheck
+    # --no-hash promet de n'empreinter aucun fichier : la détection par
+    # empreinte (contenu = interpréteur connu) et la confrontation à la base
+    # de paquets (qui nécessite un MD5 du candidat) sont donc désactivées,
+    # au profit d'un simple pic de magie 8 octets pour garder un 'kind'
+    # correct. Les signaux qui ne nécessitent aucune lecture de contenu
+    # (inscriptible par tous) restent actifs.
+    do_hash = not args.no_hash
+    verdicts = ({} if (args.no_pkgcheck or not do_hash)
                 else verify_against_packages([p for p, _ in candidates],
                                              args.max_file_size))
-    shells = interpreter_hashes(args.max_file_size)
+    shells = interpreter_hashes(args.max_file_size) if do_hash else {}
     findings = []
     for path, st in candidates:
         score = 0
         reasons = []
-        digest, magic = sha256_path(path, args.max_file_size)
+        if do_hash:
+            digest, magic = sha256_path(path, args.max_file_size)
+        else:
+            digest = None
+            magic = read_bytes(path, limit=8, require_regular=True) or b''
 
         if digest and digest in shells:
             score += 90
-            reasons.append('Binaire SUID/SGID dont le contenu est un '
-                           'interpréteur (%s) : porte dérobée d\'élévation'
-                           % shells[digest])
+            reasons.append(('Binaire SUID/SGID dont le contenu est un '
+                            'interpréteur (%s) : porte dérobée d\'élévation'
+                            % shells[digest], 90))
         verdict = verdicts.get(path)
         if verdict == 'modifie':
             score += 80
-            reasons.append('Binaire SUID/SGID de distribution MODIFIÉ')
+            reasons.append(('Binaire SUID/SGID de distribution MODIFIÉ', 80))
         elif verdict == 'hors-paquet':
             score += 50
-            reasons.append('Binaire SUID/SGID dans un chemin système mais '
-                           'revendiqué par aucun paquet installé')
+            reasons.append(('Binaire SUID/SGID dans un chemin système mais '
+                            'revendiqué par aucun paquet installé', 50))
         if st.st_mode & stat.S_IWOTH:
             score += 60
-            reasons.append('Binaire SUID/SGID inscriptible par tous')
+            reasons.append(('Binaire SUID/SGID inscriptible par tous', 60))
 
         if score < args.min_file_score:
             continue
         findings.append({'path': path, 'st': st, 'score': score,
                          'reasons': reasons, 'digest': digest,
+                         'kind': file_kind(magic)})
+    return findings
+
+
+def sweep_untracked_system_binaries(args):
+    """Confrontation légère et NON récursive des répertoires binaires système
+    principaux à la base de paquets, exécutée par défaut (contrairement à
+    --verify-system, coûteux et optionnel). Ferme l'angle mort d'un implant
+    posé directement dans /usr/bin/, /usr/sbin/, /bin/ ou /sbin/ sans bit
+    SUID et sans être en cours d'exécution : jusqu'ici invisible sauf à
+    penser explicitement à --verify-system. --no-hash désactive ce contrôle
+    (il nécessite de lire chaque binaire candidat pour le comparer à son
+    empreinte de paquet) ; --no-pkgcheck aussi."""
+    if args.no_pkgcheck or args.no_hash:
+        return []
+    seen = set()
+    targets = []
+    for base in PRIMARY_SYSTEM_BIN_DIRS:
+        try:
+            entries = list(os.scandir(base))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            try:
+                key = (st.st_dev, st.st_ino)
+            except AttributeError:
+                key = entry.path
+            if key in seen:
+                continue          # usr-merge : /bin/x et /usr/bin/x
+            seen.add(key)
+            targets.append((entry.path, st))
+
+    if not targets:
+        return []
+    verdicts = verify_against_packages([p for p, _ in targets], args.max_file_size)
+    if not verdicts:
+        return []              # hôte non-dpkg : contrôle silencieusement ignoré
+
+    findings = []
+    for path, st in targets:
+        verdict = verdicts.get(path)
+        if verdict in (None, 'ok'):
+            continue
+        # 'modifie' (empreinte divergente) reste un signal fort et rare :
+        # poids inchangé par rapport à --verify-system. 'hors-paquet' est en
+        # revanche courant et légitime sur une image Docker officielle
+        # (/usr/sbin/policy-rc.d, /usr/bin/pebble, /usr/sbin/initctl... des
+        # utilitaires ajoutés par l'outillage de construction de l'image,
+        # jamais par un paquet) : le signaler par défaut au même poids que
+        # --verify-system (45, au-dessus du seuil d'affichage) noierait le
+        # résultat dans le bruit sur des hôtes parfaitement sains. Poids
+        # réduit ici pour rester silencieux par défaut (INFO, sous le seuil
+        # d'AFFICHAGE — le seuil de RETENTION par défaut reste franchi, donc
+        # l'empreinte demeure dans la table de pivot CTI) ; --verify-system,
+        # explicitement demandé, garde le poids plein (45).
+        score = 80 if verdict == 'modifie' else 25
+        reason = ('Binaire de distribution MODIFIÉ (contenu différent de '
+                  'l\'empreinte du paquet)' if verdict == 'modifie' else
+                  'Fichier dans un chemin système revendiqué par aucun '
+                  'paquet installé')
+        if score < args.min_file_score:
+            continue
+        digest, magic = sha256_path(path, args.max_file_size)
+        findings.append({'path': path, 'st': st, 'score': score,
+                         'reasons': [(reason, score)], 'digest': digest,
                          'kind': file_kind(magic)})
     return findings
 
@@ -2033,6 +2173,16 @@ def hash_persistence_files():
     return results
 
 
+def _digest_rank(digest):
+    """Ordonne les empreintes candidates lors d'une fusion : un SHA256 réel
+    prime sur un marqueur 'NON-CALCULE (...)' , qui prime sur une absence."""
+    if digest and re.fullmatch(r'[0-9a-f]{64}', digest):
+        return 2
+    if digest:
+        return 1
+    return 0
+
+
 def module_filesystem(args, is_root):
     out(C.cyan('[*] Étape 4/4 — Chasse aux artefacts sur les répertoires à risque'))
     roots = build_hunt_roots(is_root, args.extra_dir)
@@ -2046,9 +2196,17 @@ def module_filesystem(args, is_root):
     for root in roots:
         raw_findings.extend(scan_root(root, args, budget))
     raw_findings.extend(sweep_setuid_binaries(args))
+    raw_findings.extend(sweep_untracked_system_binaries(args))
 
-    # Deux racines peuvent couvrir le même fichier (/root et /root/.ssh) :
-    # un artefact ne doit apparaître qu'une fois, avec son meilleur score.
+    # Deux racines peuvent couvrir le même fichier (/root et /root/.ssh), ou
+    # deux détections différentes converger sur le même chemin (heuristique
+    # générique de score_file + empreinte d'interpréteur de
+    # sweep_setuid_binaries) : fusion par texte de motif plutôt que
+    # remplacement par le seul score le plus haut, pour ne jamais faire
+    # disparaître un motif décisif (ex. « ce SUID est un shell renommé »)
+    # simplement parce qu'une autre détection, moins précise, marquait un
+    # score plus élevé sur ce même fichier. Un motif au texte identique
+    # (cas des racines qui se recouvrent) n'est compté qu'une fois.
     unique = {}
     for item in raw_findings:
         try:
@@ -2056,8 +2214,17 @@ def module_filesystem(args, is_root):
         except OSError:
             key = item['path']
         previous = unique.get(key)
-        if previous is None or item['score'] > previous['score']:
-            unique[key] = item
+        if previous is None:
+            unique[key] = dict(item)
+            continue
+        merged_reasons = dict(previous['reasons'])
+        for text, weight in item['reasons']:
+            merged_reasons.setdefault(text, weight)
+        previous['reasons'] = list(merged_reasons.items())
+        previous['score'] = sum(merged_reasons.values())
+        if _digest_rank(item['digest']) > _digest_rank(previous['digest']):
+            previous['digest'] = item['digest']
+            previous['kind'] = item['kind']
     all_findings = list(unique.values())
 
     all_findings.sort(key=lambda f: -f['score'])
@@ -2089,8 +2256,8 @@ def module_filesystem(args, is_root):
             'Propriétaire: UID %d / GID %d' % (st.st_uid, st.st_gid),
             'Modifié le  : %s   (ctime %s)' % (fmt_time(st.st_mtime), fmt_time(st.st_ctime)),
         ]
-        for reason in item['reasons']:
-            details.append('Motif       : %s' % reason)
+        for reason, weight in sorted(item['reasons'], key=lambda r: -r[1]):
+            details.append('Motif (+%-3d): %s' % (weight, reason))
         if item['digest'] and item['digest'].startswith('NON-CALCULE'):
             details.append('SHA256      : %s — relancer avec --max-file-size '
                            'pour empreinter cet artefact' % item['digest'])
